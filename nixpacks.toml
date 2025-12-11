@@ -1,8 +1,0 @@
-[phases.setup]
-nixPkgs = ['git', 'nodejs', 'npm', 'bash', 'coreutils']
-
-[phases.build]
-cmds = ['npm install']
-
-[start]
-cmd = 'node index.js'
