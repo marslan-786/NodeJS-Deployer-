@@ -3,10 +3,9 @@ const { MongoClient } = require('mongodb');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const readline = require('readline');
-const settings = require('./settings');
 
 // ================= CONFIGURATION =================
+// یہ ویری ایبلز یہیں ڈیفائن ہیں، کسی اور فائل کی ضرورت نہیں
 const TOKEN = "8452280797:AAEruS20yx0YCb2T8aHIZk8xjzRlLb6GDAk"; 
 const MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rlwy.net:29609"; 
 const OWNER_IDS = [8167904992, 7134046678, 6022286935]; 
@@ -17,19 +16,14 @@ const client = new MongoClient(MONGO_URL);
 let db, projectsCol, keysCol, usersCol;
 
 // Global Variables
-// Structure: { projectId: { process: ChildProcess, logging: Boolean, logStream: WriteStream } }
 const ACTIVE_SESSIONS = {}; 
 const USER_STATE = {}; 
 const SESSION_WATCHERS = {}; 
 
 // Temp Logs Directory (RAM/Ephemeral)
 const LOG_DIR = path.join(__dirname, 'temp_logs');
-if (fs.existsSync(LOG_DIR)) fs.rmSync(LOG_DIR, { recursive: true, force: true }); // Cleanup on restart
+if (fs.existsSync(LOG_DIR)) fs.rmSync(LOG_DIR, { recursive: true, force: true });
 fs.mkdirSync(LOG_DIR, { recursive: true });
-
-// Input Helper
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
 // Connect DB
 async function connectDB() {
@@ -126,23 +120,17 @@ async function restoreSessionFromDB(userId, projName, basePath) {
 async function forceStopProject(userId, projName) {
     const projectId = `${userId}_${projName}`;
     
-    // Stop Process
     if (ACTIVE_SESSIONS[projectId] && ACTIVE_SESSIONS[projectId].process) {
         try { ACTIVE_SESSIONS[projectId].process.kill('SIGKILL'); } catch (e) {}
-        
-        // Close Log Stream
         if(ACTIVE_SESSIONS[projectId].logStream) ACTIVE_SESSIONS[projectId].logStream.end();
-        
         delete ACTIVE_SESSIONS[projectId];
     }
 
-    // Stop Session Watcher
     if (SESSION_WATCHERS[projectId]) {
         SESSION_WATCHERS[projectId].close();
         delete SESSION_WATCHERS[projectId];
     }
 
-    // Update DB
     await projectsCol.updateOne(
         { user_id: userId, name: projName }, 
         { $set: { status: "Stopped" } }
@@ -153,12 +141,10 @@ async function startProject(userId, projName, chatId, silent = false) {
     const basePath = path.join(__dirname, 'deployments', userId.toString(), projName);
     const projectId = `${userId}_${projName}`;
 
-    // Kill existing if any
     await forceStopProject(userId, projName);
 
     if (!silent && chatId) bot.sendMessage(chatId, `⏳ **Initializing ${projName}...**`);
 
-    // Install Deps
     if (fs.existsSync(path.join(basePath, 'package.json'))) {
         try {
             if (!silent || !fs.existsSync(path.join(basePath, 'node_modules'))) {
@@ -173,19 +159,16 @@ async function startProject(userId, projName, chatId, silent = false) {
         bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Live Logging Active:**\nWait for pairing code...`);
     }
 
-    // Start Node Process
     const child = spawn('node', ['index.js'], { cwd: basePath, stdio: ['pipe', 'pipe', 'pipe'] });
 
-    // Setup Log File Stream (RAM)
     const logFilePath = path.join(LOG_DIR, `${projectId}.txt`);
-    const logStream = fs.createWriteStream(logFilePath, { flags: 'w' }); // Overwrite old logs
+    const logStream = fs.createWriteStream(logFilePath, { flags: 'w' });
 
-    // Initialize Session Object
     ACTIVE_SESSIONS[projectId] = {
         process: child,
-        logging: true, // Initially True for Setup
+        logging: true,
         logStream: logStream,
-        chatId: chatId // Remember chat ID for logging
+        chatId: chatId
     };
 
     setupSessionSync(userId, projName, basePath);
@@ -198,52 +181,40 @@ async function startProject(userId, projName, chatId, silent = false) {
     // 🔥 LOGGING SYSTEM 🔥
     child.stdout.on('data', (data) => {
         const rawOutput = data.toString();
-        
-        // 1. Write to File (Always)
         logStream.write(rawOutput);
 
-        // 2. Determine if we should send to Telegram
         if (!ACTIVE_SESSIONS[projectId] || !ACTIVE_SESSIONS[projectId].logging || !chatId) return;
 
-        // Cleanup Colors for Telegram
         const cleanOutput = rawOutput.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
 
-        // --- PAIRING CODE ---
         const codeMatch = cleanOutput.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/);
         if (codeMatch) {
             bot.sendMessage(chatId, `🔑 **YOUR PAIRING CODE:**\n\n\`${codeMatch[0]}\``, { parse_mode: "Markdown" });
             return;
         }
 
-        // --- INPUT ---
         if (cleanOutput.includes("Enter Number") || cleanOutput.includes("Pairing Code") || cleanOutput.includes("OTP")) {
             bot.sendMessage(chatId, `⌨️ **Input Required:**\n\`${cleanOutput.trim()}\``, { parse_mode: "Markdown" });
             return;
         }
 
-        // --- AUTO STOP LOGGING ON SUCCESS ---
         if (cleanOutput.includes("Opened connection") || 
             cleanOutput.includes("Bot Connected") || 
             cleanOutput.includes("Connected Successfully")) {
             
             bot.sendMessage(chatId, `✅ **Success! Bot is Online.**\n\n🔇 *Live Logging Disabled Automatically.*`);
-            
-            // Disable Logging
             if (ACTIVE_SESSIONS[projectId]) ACTIVE_SESSIONS[projectId].logging = false;
             return;
         }
 
-        // --- GENERAL LOGS ---
         if (!cleanOutput.includes("npm") && !cleanOutput.includes("update") && cleanOutput.trim() !== "") {
              if(cleanOutput.length < 300) bot.sendMessage(chatId, `🖥️ \`${cleanOutput.trim()}\``, { parse_mode: "Markdown" });
         }
     });
 
     child.stderr.on('data', (data) => {
-        logStream.write(data); // Write Error to File
+        logStream.write(data);
         const error = data.toString();
-        // Send critical errors even if logging is off? Maybe better to keep silent unless logging is on.
-        // But for now, let's respect the logging flag except for crashes.
         if (ACTIVE_SESSIONS[projectId] && ACTIVE_SESSIONS[projectId].logging && chatId && !error.includes("npm") && !error.includes("ExperimentalWarning")) {
              bot.sendMessage(chatId, `⚠️ **Error:**\n\`${error.slice(0, 200)}\``, { parse_mode: "Markdown" });
         }
@@ -269,9 +240,6 @@ bot.on('message', async (msg) => {
     const userId = msg.from.id;
     const text = msg.text;
 
-    // Check Input for ANY active session linked to this chat
-    // (Simple lookup: find which project is logging to this chat)
-    // For simplicity, we iterate active sessions.
     let targetProjId = null;
     for (const [pid, session] of Object.entries(ACTIVE_SESSIONS)) {
         if (session.chatId === chatId && session.logging) {
@@ -378,16 +346,14 @@ bot.on('callback_query', async (query) => {
         const projName = getProjNameFromData(data, "menu_");
         const projectId = `${userId}_${projName}`;
         
-        // Determine States
         const isRunning = ACTIVE_SESSIONS[projectId] ? true : false;
         const isLogging = (ACTIVE_SESSIONS[projectId] && ACTIVE_SESSIONS[projectId].logging) ? true : false;
 
-        // Toggle Buttons Logic
         const runBtnText = isRunning ? "🛑 Stop" : "▶️ Start";
-        const runCallback = `toggle_run_${projName}`; // Single callback for toggle
+        const runCallback = `toggle_run_${projName}`; 
 
         const logBtnText = isLogging ? "🔴 Disable Logs" : "🟢 Enable Logs";
-        const logCallback = `toggle_log_${projName}`; // Single callback for toggle
+        const logCallback = `toggle_log_${projName}`; 
 
         const keyboard = [
             [{ text: runBtnText, callback_data: runCallback }, { text: logBtnText, callback_data: logCallback }],
@@ -398,26 +364,20 @@ bot.on('callback_query', async (query) => {
         bot.editMessageText(`⚙️ Manage: **${projName}**\n\nStatus: ${isRunning ? 'Running 🟢' : 'Stopped 🔴'}`, { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: keyboard } });
     }
     
-    // --- TOGGLE RUN (START/STOP) ---
+    // --- TOGGLE RUN ---
     else if (data.startsWith("toggle_run_")) {
         const projName = getProjNameFromData(data, "toggle_run_");
         const projectId = `${userId}_${projName}`;
         
         if (ACTIVE_SESSIONS[projectId]) {
-            // IF RUNNING -> STOP
             await forceStopProject(userId, projName);
             bot.answerCallbackQuery(query.id, { text: "Stopped!" });
         } else {
-            // IF STOPPED -> START
             bot.deleteMessage(chatId, query.message.message_id); 
             startProject(userId, projName, chatId);
             bot.answerCallbackQuery(query.id, { text: "Starting..." });
-            return; // Exit to avoid re-rendering menu immediately (startProject handles logs)
+            return; 
         }
-        // Refresh Menu
-        const newKeyboard = getMenuKeyboard(userId, projName); // Helper needed or copy logic
-        // For simplicity, just trigger menu_ callback logic again manually or ask user to click back
-        // Or recursively call the menu handler logic:
         bot.emit('callback_query', { ...query, data: `menu_${projName}` });
     }
 
@@ -432,7 +392,6 @@ bot.on('callback_query', async (query) => {
         } else {
             bot.answerCallbackQuery(query.id, { text: "Bot is not running!" });
         }
-        // Refresh Menu
         bot.emit('callback_query', { ...query, data: `menu_${projName}` });
     }
 
@@ -486,5 +445,3 @@ async function restoreProjects() {
         }
     }
 }
-
-process.on('uncaughtException', (err) => console.log('Err:', err));
