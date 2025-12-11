@@ -3,6 +3,8 @@ const { MongoClient } = require('mongodb');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
+const settings = require('./settings');
 
 // ================= CONFIGURATION =================
 const TOKEN = "8452280797:AAEruS20yx0YCb2T8aHIZk8xjzRlLb6GDAk"; 
@@ -15,10 +17,19 @@ const client = new MongoClient(MONGO_URL);
 let db, projectsCol, keysCol, usersCol;
 
 // Global Variables
-const ACTIVE_PROCESSES = {}; 
+// Structure: { projectId: { process: ChildProcess, logging: Boolean, logStream: WriteStream } }
+const ACTIVE_SESSIONS = {}; 
 const USER_STATE = {}; 
-const INTERACTIVE_SESSIONS = {}; 
 const SESSION_WATCHERS = {}; 
+
+// Temp Logs Directory (RAM/Ephemeral)
+const LOG_DIR = path.join(__dirname, 'temp_logs');
+if (fs.existsSync(LOG_DIR)) fs.rmSync(LOG_DIR, { recursive: true, force: true }); // Cleanup on restart
+fs.mkdirSync(LOG_DIR, { recursive: true });
+
+// Input Helper
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
 // Connect DB
 async function connectDB() {
@@ -57,34 +68,6 @@ function getMainMenu(userId) {
 
 function getProjNameFromData(data, prefix) {
     return data.substring(prefix.length);
-}
-
-// 🔥 FORCE STOP FUNCTION (Fixes Zombie Processes) 🔥
-async function forceStopProject(userId, projName) {
-    const projectId = `${userId}_${projName}`;
-    
-    // 1. Kill the Process
-    if (ACTIVE_PROCESSES[projectId]) {
-        try {
-            // SIGKILL ensures the process dies immediately
-            ACTIVE_PROCESSES[projectId].kill('SIGKILL'); 
-        } catch (e) {
-            console.error(`Kill Error: ${e.message}`);
-        }
-        delete ACTIVE_PROCESSES[projectId];
-    }
-
-    // 2. Stop Session Watcher
-    if (SESSION_WATCHERS[projectId]) {
-        SESSION_WATCHERS[projectId].close();
-        delete SESSION_WATCHERS[projectId];
-    }
-
-    // 3. Update DB Status
-    await projectsCol.updateOne(
-        { user_id: userId, name: projName }, 
-        { $set: { status: "Stopped" } }
-    );
 }
 
 // ================= PROCESS MANAGEMENT =================
@@ -139,17 +122,43 @@ async function restoreSessionFromDB(userId, projName, basePath) {
     }
 }
 
+// 🔥 FORCE STOP FUNCTION 🔥
+async function forceStopProject(userId, projName) {
+    const projectId = `${userId}_${projName}`;
+    
+    // Stop Process
+    if (ACTIVE_SESSIONS[projectId] && ACTIVE_SESSIONS[projectId].process) {
+        try { ACTIVE_SESSIONS[projectId].process.kill('SIGKILL'); } catch (e) {}
+        
+        // Close Log Stream
+        if(ACTIVE_SESSIONS[projectId].logStream) ACTIVE_SESSIONS[projectId].logStream.end();
+        
+        delete ACTIVE_SESSIONS[projectId];
+    }
+
+    // Stop Session Watcher
+    if (SESSION_WATCHERS[projectId]) {
+        SESSION_WATCHERS[projectId].close();
+        delete SESSION_WATCHERS[projectId];
+    }
+
+    // Update DB
+    await projectsCol.updateOne(
+        { user_id: userId, name: projName }, 
+        { $set: { status: "Stopped" } }
+    );
+}
+
 async function startProject(userId, projName, chatId, silent = false) {
     const basePath = path.join(__dirname, 'deployments', userId.toString(), projName);
     const projectId = `${userId}_${projName}`;
 
-    // Ensure previous instance is dead before starting new one
-    if (ACTIVE_PROCESSES[projectId]) {
-        await forceStopProject(userId, projName);
-    }
+    // Kill existing if any
+    await forceStopProject(userId, projName);
 
     if (!silent && chatId) bot.sendMessage(chatId, `⏳ **Initializing ${projName}...**`);
 
+    // Install Deps
     if (fs.existsSync(path.join(basePath, 'package.json'))) {
         try {
             if (!silent || !fs.existsSync(path.join(basePath, 'node_modules'))) {
@@ -161,19 +170,23 @@ async function startProject(userId, projName, chatId, silent = false) {
     try { await restoreSessionFromDB(userId, projName, basePath); } catch (e) {}
 
     if (!silent && chatId) {
-        bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Interactive Mode Active:**\nReply with Number/OTP when asked.`);
+        bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Live Logging Active:**\nWait for pairing code...`);
     }
 
-    // 🔥 FIX: REMOVED 'shell: true' TO FIX ZOMBIE PROCESSES 🔥
-    // اس سے اب پروسیس صحیح سے Kill ہوگا
+    // Start Node Process
     const child = spawn('node', ['index.js'], { cwd: basePath, stdio: ['pipe', 'pipe', 'pipe'] });
 
-    child.on('error', (err) => {
-        if (chatId) bot.sendMessage(chatId, `❌ **System Error:**\n${err.message}`);
-    });
+    // Setup Log File Stream (RAM)
+    const logFilePath = path.join(LOG_DIR, `${projectId}.txt`);
+    const logStream = fs.createWriteStream(logFilePath, { flags: 'w' }); // Overwrite old logs
 
-    ACTIVE_PROCESSES[projectId] = child;
-    if (chatId) INTERACTIVE_SESSIONS[chatId] = projectId; 
+    // Initialize Session Object
+    ACTIVE_SESSIONS[projectId] = {
+        process: child,
+        logging: true, // Initially True for Setup
+        logStream: logStream,
+        chatId: chatId // Remember chat ID for logging
+    };
 
     setupSessionSync(userId, projName, basePath);
 
@@ -182,55 +195,70 @@ async function startProject(userId, projName, chatId, silent = false) {
         { $set: { status: "Running", path: basePath } }
     );
 
-    // Logging System
+    // 🔥 LOGGING SYSTEM 🔥
     child.stdout.on('data', (data) => {
         const rawOutput = data.toString();
+        
+        // 1. Write to File (Always)
+        logStream.write(rawOutput);
+
+        // 2. Determine if we should send to Telegram
+        if (!ACTIVE_SESSIONS[projectId] || !ACTIVE_SESSIONS[projectId].logging || !chatId) return;
+
+        // Cleanup Colors for Telegram
         const cleanOutput = rawOutput.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
 
-        if (!INTERACTIVE_SESSIONS[chatId] || INTERACTIVE_SESSIONS[chatId] !== projectId) return;
-
+        // --- PAIRING CODE ---
         const codeMatch = cleanOutput.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/);
         if (codeMatch) {
             bot.sendMessage(chatId, `🔑 **YOUR PAIRING CODE:**\n\n\`${codeMatch[0]}\``, { parse_mode: "Markdown" });
             return;
         }
 
+        // --- INPUT ---
         if (cleanOutput.includes("Enter Number") || cleanOutput.includes("Pairing Code") || cleanOutput.includes("OTP")) {
             bot.sendMessage(chatId, `⌨️ **Input Required:**\n\`${cleanOutput.trim()}\``, { parse_mode: "Markdown" });
             return;
         }
 
+        // --- AUTO STOP LOGGING ON SUCCESS ---
         if (cleanOutput.includes("Opened connection") || 
-            cleanOutput.includes("Connection open") || 
-            cleanOutput.includes("Bot Connected") ||
+            cleanOutput.includes("Bot Connected") || 
             cleanOutput.includes("Connected Successfully")) {
             
-            bot.sendMessage(chatId, `✅ **Success! Bot is Running.**\n\n🔇 *Live Logging Muted.*`);
-            delete INTERACTIVE_SESSIONS[chatId]; 
+            bot.sendMessage(chatId, `✅ **Success! Bot is Online.**\n\n🔇 *Live Logging Disabled Automatically.*`);
+            
+            // Disable Logging
+            if (ACTIVE_SESSIONS[projectId]) ACTIVE_SESSIONS[projectId].logging = false;
             return;
         }
 
+        // --- GENERAL LOGS ---
         if (!cleanOutput.includes("npm") && !cleanOutput.includes("update") && cleanOutput.trim() !== "") {
              if(cleanOutput.length < 300) bot.sendMessage(chatId, `🖥️ \`${cleanOutput.trim()}\``, { parse_mode: "Markdown" });
         }
     });
 
     child.stderr.on('data', (data) => {
+        logStream.write(data); // Write Error to File
         const error = data.toString();
-        if (chatId && !error.includes("npm") && !error.includes("ExperimentalWarning")) {
+        // Send critical errors even if logging is off? Maybe better to keep silent unless logging is on.
+        // But for now, let's respect the logging flag except for crashes.
+        if (ACTIVE_SESSIONS[projectId] && ACTIVE_SESSIONS[projectId].logging && chatId && !error.includes("npm") && !error.includes("ExperimentalWarning")) {
              bot.sendMessage(chatId, `⚠️ **Error:**\n\`${error.slice(0, 200)}\``, { parse_mode: "Markdown" });
         }
     });
 
     child.on('close', (code) => {
-        // Only notify if we didn't force stop it manually
-        if (ACTIVE_PROCESSES[projectId]) {
-            delete ACTIVE_PROCESSES[projectId];
-            if (INTERACTIVE_SESSIONS[chatId] === projectId) delete INTERACTIVE_SESSIONS[chatId];
-            if (SESSION_WATCHERS[projectId]) SESSION_WATCHERS[projectId].close();
-            projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
-            if (chatId && !silent) bot.sendMessage(chatId, `🛑 **Bot Stopped** (Exit Code: ${code})`);
+        if(ACTIVE_SESSIONS[projectId]) {
+            logStream.end();
+            delete ACTIVE_SESSIONS[projectId];
         }
+        if (SESSION_WATCHERS[projectId]) SESSION_WATCHERS[projectId].close();
+        
+        projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
+        
+        if (chatId && !silent) bot.sendMessage(chatId, `🛑 **Bot Stopped** (Exit Code: ${code})`);
     });
 }
 
@@ -241,11 +269,21 @@ bot.on('message', async (msg) => {
     const userId = msg.from.id;
     const text = msg.text;
 
-    if (INTERACTIVE_SESSIONS[chatId] && text && !text.startsWith("/")) {
-        const projectId = INTERACTIVE_SESSIONS[chatId];
-        const child = ACTIVE_PROCESSES[projectId];
-        if (child && !child.killed) {
-            try { child.stdin.write(text + "\n"); } catch (e) {}
+    // Check Input for ANY active session linked to this chat
+    // (Simple lookup: find which project is logging to this chat)
+    // For simplicity, we iterate active sessions.
+    let targetProjId = null;
+    for (const [pid, session] of Object.entries(ACTIVE_SESSIONS)) {
+        if (session.chatId === chatId && session.logging) {
+            targetProjId = pid;
+            break;
+        }
+    }
+
+    if (targetProjId && text && !text.startsWith("/")) {
+        const session = ACTIVE_SESSIONS[targetProjId];
+        if (session.process && !session.process.killed) {
+            try { session.process.stdin.write(text + "\n"); } catch (e) {}
             return;
         }
     }
@@ -291,8 +329,6 @@ bot.on('message', async (msg) => {
 
 bot.on('document', async (msg) => {
     const userId = msg.from.id;
-    
-    // Check for both New Deploy AND Update Mode
     if (USER_STATE[userId] && (USER_STATE[userId].step === "wait_files" || USER_STATE[userId].step === "update_files")) {
         const projName = USER_STATE[userId].name;
         const fileName = msg.document.file_name;
@@ -308,25 +344,18 @@ bot.on('document', async (msg) => {
         await projectsCol.updateOne({ user_id: userId, name: projName }, { $pull: { files: { name: fileName } } });
         await projectsCol.updateOne({ user_id: userId, name: projName }, { $push: { files: { name: fileName, content: Buffer.from(buffer) } } }, { upsert: true });
 
-        // 🔥 FIXED UPDATE LOGIC 🔥
         if (USER_STATE[userId].step === "update_files") {
-            bot.sendMessage(msg.chat.id, `🔄 **Updated:** \`${fileName}\`\n\n🛑 Stopping old process...\n🚀 Restarting with new code...`);
-            
-            // 1. Force Stop
+            bot.sendMessage(msg.chat.id, `🔄 **Updated:** \`${fileName}\`\n\n🛑 Restarting Bot...`);
             await forceStopProject(userId, projName);
-            
-            // 2. Start Again
             startProject(userId, projName, msg.chat.id);
-            
-            // Clear state so user doesn't keep uploading
-            delete USER_STATE[userId]; 
+            delete USER_STATE[userId];
         } else {
             bot.sendMessage(msg.chat.id, `📥 Received: \`${fileName}\``);
         }
     }
 });
 
-// ================= CALLBACK HANDLING =================
+// ================= CALLBACK HANDLING (DYNAMIC TOGGLES) =================
 
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
@@ -344,44 +373,86 @@ bot.on('callback_query', async (query) => {
         bot.editMessageText("📂 **Your Projects**", { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: keyboard } });
     }
     
+    // --- MANAGE MENU ---
     else if (data.startsWith("menu_")) {
         const projName = getProjNameFromData(data, "menu_");
+        const projectId = `${userId}_${projName}`;
+        
+        // Determine States
+        const isRunning = ACTIVE_SESSIONS[projectId] ? true : false;
+        const isLogging = (ACTIVE_SESSIONS[projectId] && ACTIVE_SESSIONS[projectId].logging) ? true : false;
+
+        // Toggle Buttons Logic
+        const runBtnText = isRunning ? "🛑 Stop" : "▶️ Start";
+        const runCallback = `toggle_run_${projName}`; // Single callback for toggle
+
+        const logBtnText = isLogging ? "🔴 Disable Logs" : "🟢 Enable Logs";
+        const logCallback = `toggle_log_${projName}`; // Single callback for toggle
+
         const keyboard = [
-            [{ text: "🛑 Stop", callback_data: `stop_${projName}` }, { text: "▶️ Start", callback_data: `start_${projName}` }],
-            [{ text: "📝 Update Files", callback_data: `upd_${projName}` }, { text: "🗑️ Delete", callback_data: `del_${projName}` }],
+            [{ text: runBtnText, callback_data: runCallback }, { text: logBtnText, callback_data: logCallback }],
+            [{ text: "📝 Update Files", callback_data: `upd_${projName}` }, { text: "📥 Download Logs", callback_data: `get_logs_${projName}` }],
+            [{ text: "🗑️ Delete", callback_data: `del_${projName}` }],
             [{ text: "🔙 Back", callback_data: "manage_projects" }]
         ];
-        bot.editMessageText(`⚙️ Manage: **${projName}**`, { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: keyboard } });
+        bot.editMessageText(`⚙️ Manage: **${projName}**\n\nStatus: ${isRunning ? 'Running 🟢' : 'Stopped 🔴'}`, { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: keyboard } });
     }
     
-    else if (data.startsWith("stop_")) {
-        const projName = getProjNameFromData(data, "stop_");
+    // --- TOGGLE RUN (START/STOP) ---
+    else if (data.startsWith("toggle_run_")) {
+        const projName = getProjNameFromData(data, "toggle_run_");
+        const projectId = `${userId}_${projName}`;
         
-        // 🔥 USE FORCE STOP FUNCTION 🔥
-        await forceStopProject(userId, projName);
-        
-        bot.answerCallbackQuery(query.id, { text: "Stopped Successfully!" });
-        
+        if (ACTIVE_SESSIONS[projectId]) {
+            // IF RUNNING -> STOP
+            await forceStopProject(userId, projName);
+            bot.answerCallbackQuery(query.id, { text: "Stopped!" });
+        } else {
+            // IF STOPPED -> START
+            bot.deleteMessage(chatId, query.message.message_id); 
+            startProject(userId, projName, chatId);
+            bot.answerCallbackQuery(query.id, { text: "Starting..." });
+            return; // Exit to avoid re-rendering menu immediately (startProject handles logs)
+        }
         // Refresh Menu
-        const keyboard = [
-            [{ text: "🛑 Stop", callback_data: `stop_${projName}` }, { text: "▶️ Start", callback_data: `start_${projName}` }],
-            [{ text: "📝 Update Files", callback_data: `upd_${projName}` }, { text: "🗑️ Delete", callback_data: `del_${projName}` }],
-            [{ text: "🔙 Back", callback_data: "manage_projects" }]
-        ];
-        bot.editMessageReplyMarkup({ inline_keyboard: keyboard }, { chat_id: chatId, message_id: query.message.message_id });
+        const newKeyboard = getMenuKeyboard(userId, projName); // Helper needed or copy logic
+        // For simplicity, just trigger menu_ callback logic again manually or ask user to click back
+        // Or recursively call the menu handler logic:
+        bot.emit('callback_query', { ...query, data: `menu_${projName}` });
     }
-    
-    else if (data.startsWith("start_")) {
-        const projName = getProjNameFromData(data, "start_");
-        bot.deleteMessage(chatId, query.message.message_id); 
-        startProject(userId, projName, chatId);
+
+    // --- TOGGLE LOGS ---
+    else if (data.startsWith("toggle_log_")) {
+        const projName = getProjNameFromData(data, "toggle_log_");
+        const projectId = `${userId}_${projName}`;
+        
+        if (ACTIVE_SESSIONS[projectId]) {
+            ACTIVE_SESSIONS[projectId].logging = !ACTIVE_SESSIONS[projectId].logging;
+            bot.answerCallbackQuery(query.id, { text: `Logs ${ACTIVE_SESSIONS[projectId].logging ? 'Enabled' : 'Disabled'}` });
+        } else {
+            bot.answerCallbackQuery(query.id, { text: "Bot is not running!" });
+        }
+        // Refresh Menu
+        bot.emit('callback_query', { ...query, data: `menu_${projName}` });
+    }
+
+    // --- DOWNLOAD LOGS ---
+    else if (data.startsWith("get_logs_")) {
+        const projName = getProjNameFromData(data, "get_logs_");
+        const projectId = `${userId}_${projName}`;
+        const logFile = path.join(LOG_DIR, `${projectId}.txt`);
+
+        if (fs.existsSync(logFile)) {
+            bot.sendDocument(chatId, logFile, { caption: `📄 Logs for ${projName}` });
+        } else {
+            bot.answerCallbackQuery(query.id, { text: "No logs found (RAM Cleared or New Bot)", show_alert: true });
+        }
     }
     
     else if (data.startsWith("del_")) {
         const projName = getProjNameFromData(data, "del_");
-        const projId = `${userId}_${projName}`;
         try {
-            await forceStopProject(userId, projName); // Stop first
+            await forceStopProject(userId, projName); 
             await projectsCol.deleteOne({ user_id: userId, name: projName });
             const dir = path.join(__dirname, 'deployments', userId.toString(), projName);
             if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
@@ -415,3 +486,5 @@ async function restoreProjects() {
         }
     }
 }
+
+process.on('uncaughtException', (err) => console.log('Err:', err));
