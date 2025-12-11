@@ -5,8 +5,8 @@ const fs = require('fs');
 const path = require('path');
 
 // ================= CONFIGURATION =================
-const TOKEN = "8452280797:AAEruS20yx0YCb2T8aHIZk8xjzRlLb6GDAk"; // Bot Token
-const MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rlwy.net:29609"; // Mongo URL
+const TOKEN = "8452280797:AAEruS20yx0YCb2T8aHIZk8xjzRlLb6GDAk"; // اپنا بوٹ ٹوکن یہاں لکھیں
+const MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rlwy.net:29609"; // MongoDB URL
 const OWNER_IDS = [8167904992, 7134046678]; // Owner IDs
 
 // ================= SETUP =================
@@ -15,9 +15,9 @@ const client = new MongoClient(MONGO_URL);
 let db, projectsCol, keysCol, usersCol;
 
 // Global Variables
-const ACTIVE_PROCESSES = {}; // stores running child processes
-const USER_STATE = {}; // stores user steps
-const INTERACTIVE_SESSIONS = {}; // stores user mapping to process for input
+const ACTIVE_PROCESSES = {}; 
+const USER_STATE = {}; 
+const INTERACTIVE_SESSIONS = {}; 
 
 // Connect DB
 async function connectDB() {
@@ -28,7 +28,8 @@ async function connectDB() {
         keysCol = db.collection("access_keys");
         usersCol = db.collection("users");
         console.log("✅ Connected to MongoDB");
-        restoreProjects(); 
+        // تھوڑا انتظار کریں تاکہ سسٹم سیٹ ہو جائے
+        setTimeout(restoreProjects, 3000); 
     } catch (e) {
         console.error("❌ DB Error:", e);
     }
@@ -56,26 +57,31 @@ function getMainMenu(userId) {
 
 // ================= PROCESS MANAGEMENT =================
 
-// Helper to run NPM INSTALL strictly
 function installDependencies(basePath, chatId) {
     return new Promise((resolve, reject) => {
         if (!fs.existsSync(path.join(basePath, 'package.json'))) {
             return resolve("No package.json, skipping install.");
         }
 
-        bot.sendMessage(chatId, `📦 **Installing Dependencies...**\nPlease wait, this handles heavy libraries like Baileys.`);
+        if(chatId) bot.sendMessage(chatId, `📦 **Installing Dependencies...**\nRunning npm install...`);
 
+        // 🔥 IMPORTANT FIX: Shell handling & Error Listeners
         const install = spawn('npm', ['install'], { cwd: basePath, shell: true });
 
-        // Capture error logs for debugging
         let errorLog = "";
         install.stderr.on('data', (data) => { errorLog += data.toString(); });
+
+        // ماسٹر بوٹ کریش سے بچانے کے لیے
+        install.on('error', (err) => {
+            console.error(`❌ Spawn Error in Install: ${err.message}`);
+            reject(`System Error: ${err.message}`);
+        });
 
         install.on('close', (code) => {
             if (code === 0) {
                 resolve("Success");
             } else {
-                reject(`NPM Install Failed (Code ${code})\n${errorLog.slice(0, 500)}...`);
+                reject(`NPM Install Failed (Code ${code})\n${errorLog.slice(0, 300)}...`);
             }
         });
     });
@@ -85,46 +91,47 @@ async function startProject(userId, projName, chatId, silent = false) {
     const basePath = path.join(__dirname, 'deployments', userId.toString(), projName);
     const projectId = `${userId}_${projName}`;
 
-    // 1. Check if process is already running
     if (ACTIVE_PROCESSES[projectId]) {
-        if (!silent) bot.sendMessage(chatId, "⚠️ Bot is already running.");
+        if (!silent && chatId) bot.sendMessage(chatId, "⚠️ Bot is already running.");
         return;
     }
 
-    if (!silent) bot.sendMessage(chatId, `⏳ **Initializing ${projName}...**`);
+    if (!silent && chatId) bot.sendMessage(chatId, `⏳ **Initializing ${projName}...**`);
 
-    // 2. Strict Dependency Installation
-    // اگر فولڈر میں node_modules نہیں ہے یا یہ نئی ڈپلائمنٹ ہے تو انسٹال کرو
+    // Install Dependencies Logic
     if (fs.existsSync(path.join(basePath, 'package.json'))) {
         try {
-             // اگر silent (auto restore) ہے تو ہم دوبارہ انسٹال نہیں کرتے تاکہ ٹائم بچے، 
-             // مگر اگر node_modules غائب ہے (Railway Restart) تو کرنا پڑے گا۔
             if (!silent || !fs.existsSync(path.join(basePath, 'node_modules'))) {
-                await installDependencies(basePath, chatId || OWNER_IDS[0]); 
+                await installDependencies(basePath, chatId); 
             }
         } catch (err) {
             if (chatId) bot.sendMessage(chatId, `❌ **Installation Error:**\n\`${err}\``, { parse_mode: "Markdown" });
-            return; // Stop here, do not run index.js
+            console.error(`Install Failed for ${projName}: ${err}`);
+            return; 
         }
     }
 
-    // 3. Start Process
+    // Start Process
     if (!silent && chatId) {
-        bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Interactive Mode Active:**\nReply here to send input to terminal.`);
+        bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Interactive Mode Active:**\nReply here to send input.`);
     }
 
+    // 🔥 CRITICAL FIX: Add 'error' listener to prevent crash on spawn fail
     const child = spawn('node', ['index.js'], { cwd: basePath, shell: true });
+
+    child.on('error', (err) => {
+        console.error(`❌ Failed to spawn process for ${projName}:`, err);
+        if (chatId) bot.sendMessage(chatId, `❌ **System Error:** Failed to start process.\n${err.message}`);
+    });
+
     ACTIVE_PROCESSES[projectId] = child;
-    
     if (chatId) INTERACTIVE_SESSIONS[chatId] = projectId;
 
-    // Update DB Status
     await projectsCol.updateOne(
         { user_id: userId, name: projName },
         { $set: { status: "Running", path: basePath } }
     );
 
-    // --- LOGS HANDLER ---
     child.stdout.on('data', (data) => {
         const output = data.toString();
         if (chatId && INTERACTIVE_SESSIONS[chatId] === projectId && output.trim().length > 0) {
@@ -134,9 +141,7 @@ async function startProject(userId, projName, chatId, silent = false) {
 
     child.stderr.on('data', (data) => {
         const error = data.toString();
-        // Baileys often prints info logs in stderr, so filter real errors or show all
         if (chatId && INTERACTIVE_SESSIONS[chatId] === projectId && error.trim().length > 0) {
-            // Optional: Filter out "Buffer" warnings or known non-fatal errors
             bot.sendMessage(chatId, `⚠️ **Log:**\n\`${error}\``, { parse_mode: "Markdown" });
         }
     });
@@ -160,12 +165,16 @@ bot.on('message', async (msg) => {
     const userId = msg.from.id;
     const text = msg.text;
 
-    // A. Interactive Terminal Input
+    // A. Interactive Input
     if (INTERACTIVE_SESSIONS[chatId] && text && !text.startsWith("/")) {
         const projectId = INTERACTIVE_SESSIONS[chatId];
         const child = ACTIVE_PROCESSES[projectId];
-        if (child) {
-            child.stdin.write(text + "\n"); 
+        if (child && child.stdin && !child.killed) {
+            try {
+                child.stdin.write(text + "\n");
+            } catch (err) {
+                bot.sendMessage(chatId, "⚠️ Failed to send input. Process might be dead.");
+            }
             return;
         }
     }
@@ -191,22 +200,15 @@ bot.on('message', async (msg) => {
         }
     }
 
-    // C. Project Creation Logic
+    // C. Deploy Logic
     if (USER_STATE[userId]) {
         if (USER_STATE[userId].step === "ask_name") {
             const projName = text.trim().replace(/\s+/g, '_');
             const exists = await projectsCol.findOne({ user_id: userId, name: projName });
-            
             if (exists) return bot.sendMessage(chatId, "❌ Name taken. Try another.");
 
             USER_STATE[userId] = { step: "wait_files", name: projName };
-            
-            const opts = {
-                reply_markup: {
-                    resize_keyboard: true,
-                    keyboard: [[{ text: "✅ Done / Start Deploy" }]]
-                }
-            };
+            const opts = { reply_markup: { resize_keyboard: true, keyboard: [[{ text: "✅ Done / Start Deploy" }]] } };
             bot.sendMessage(chatId, `✅ Name: **${projName}**\n\nSend files (index.js, package.json).\nPress Done when finished.`, opts);
         }
         else if (text === "✅ Done / Start Deploy" && USER_STATE[userId].step === "wait_files") {
@@ -218,38 +220,23 @@ bot.on('message', async (msg) => {
     }
 });
 
-// 2. Handle File Uploads (Deploy & Update)
+// File Uploads
 bot.on('document', async (msg) => {
     const userId = msg.from.id;
-    
-    // Check if user is in 'wait_files' (New Deploy) OR 'update_files' (Manage)
     if (USER_STATE[userId] && (USER_STATE[userId].step === "wait_files" || USER_STATE[userId].step === "update_files")) {
-        
         const projName = USER_STATE[userId].name;
         const fileName = msg.document.file_name;
-        
         const dir = path.join(__dirname, 'deployments', userId.toString(), projName);
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
         const filePath = path.join(dir, fileName);
-        
         const fileLink = await bot.getFileLink(msg.document.file_id);
         const response = await fetch(fileLink);
         const buffer = await response.arrayBuffer();
         fs.writeFileSync(filePath, Buffer.from(buffer));
 
-        // DB Persistence Logic (Handles updates too)
-        // Remove old file entry if exists
-        await projectsCol.updateOne(
-            { user_id: userId, name: projName },
-            { $pull: { files: { name: fileName } } }
-        );
-        // Push new file entry
-        await projectsCol.updateOne(
-            { user_id: userId, name: projName },
-            { $push: { files: { name: fileName, content: Buffer.from(buffer) } } },
-            { upsert: true }
-        );
+        await projectsCol.updateOne({ user_id: userId, name: projName }, { $pull: { files: { name: fileName } } });
+        await projectsCol.updateOne({ user_id: userId, name: projName }, { $push: { files: { name: fileName, content: Buffer.from(buffer) } } }, { upsert: true });
 
         if (USER_STATE[userId].step === "update_files") {
             bot.sendMessage(msg.chat.id, `🔄 **Updated:** \`${fileName}\`\nRestart bot to apply changes.`);
@@ -259,46 +246,31 @@ bot.on('document', async (msg) => {
     }
 });
 
-// ================= CALLBACK QUERIES =================
-
+// Callbacks
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const userId = query.from.id;
     const data = query.data;
 
-    // 1. Deploy New
     if (data === "deploy_new") {
         USER_STATE[userId] = { step: "ask_name" };
         bot.sendMessage(chatId, "📂 Enter Project Name (No spaces):");
     }
-    
-    // 2. List Projects
     else if (data === "manage_projects") {
         const projects = await projectsCol.find({ user_id: userId }).toArray();
-        const keyboard = projects.map(p => {
-            const status = p.status === "Running" ? "🟢" : "🔴";
-            return [{ text: `${status} ${p.name}`, callback_data: `menu_${p.name}` }];
-        });
+        const keyboard = projects.map(p => [{ text: `${p.status === "Running" ? "🟢" : "🔴"} ${p.name}`, callback_data: `menu_${p.name}` }]);
         keyboard.push([{ text: "🔙 Back", callback_data: "main_menu" }]);
         bot.editMessageText("📂 **Your Projects**", { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: keyboard } });
     }
-
-    // 3. Project Menu
     else if (data.startsWith("menu_")) {
         const projName = data.split("_")[1];
         const keyboard = [
-            [
-                { text: "🛑 Stop", callback_data: `stop_${projName}` },
-                { text: "▶️ Start", callback_data: `start_${projName}` }
-            ],
-            [{ text: "📝 Update Files", callback_data: `upd_${projName}` }],
-            [{ text: "🗑️ Delete", callback_data: `del_${projName}` }],
+            [{ text: "🛑 Stop", callback_data: `stop_${projName}` }, { text: "▶️ Start", callback_data: `start_${projName}` }],
+            [{ text: "📝 Update Files", callback_data: `upd_${projName}` }, { text: "🗑️ Delete", callback_data: `del_${projName}` }],
             [{ text: "🔙 Back", callback_data: "manage_projects" }]
         ];
         bot.editMessageText(`⚙️ Manage: **${projName}**`, { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: keyboard } });
     }
-
-    // 4. Actions
     else if (data.startsWith("stop_")) {
         const projName = data.split("_")[1];
         const projId = `${userId}_${projName}`;
@@ -309,73 +281,44 @@ bot.on('callback_query', async (query) => {
             bot.answerCallbackQuery(query.id, { text: "Already Stopped" });
         }
     }
-
     else if (data.startsWith("start_")) {
         const projName = data.split("_")[1];
         bot.deleteMessage(chatId, query.message.message_id); 
         startProject(userId, projName, chatId);
     }
-
-    // --- FIX: DELETE LOGIC ---
     else if (data.startsWith("del_")) {
         const projName = data.split("_")[1];
         const projId = `${userId}_${projName}`;
-        
-        // Stop if running
         if (ACTIVE_PROCESSES[projId]) ACTIVE_PROCESSES[projId].kill();
-
-        // Delete from DB
         await projectsCol.deleteOne({ user_id: userId, name: projName });
-
-        // Delete from Disk
         const dir = path.join(__dirname, 'deployments', userId.toString(), projName);
-        if (fs.existsSync(dir)) {
-            fs.rmSync(dir, { recursive: true, force: true });
-        }
-
+        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
         bot.answerCallbackQuery(query.id, { text: "Project Deleted!" });
-        // Go back to list
         bot.deleteMessage(chatId, query.message.message_id);
     }
-
-    // --- FIX: UPDATE FILES LOGIC ---
     else if (data.startsWith("upd_")) {
         const projName = data.split("_")[1];
         USER_STATE[userId] = { step: "update_files", name: projName };
-        
-        bot.editMessageText(
-            `📝 **Update Mode: ${projName}**\n\nSend new files (e.g. updated \`index.js\` or \`package.json\`).\nThey will replace existing ones automatically.`, 
-            { 
-                chat_id: chatId, 
-                message_id: query.message.message_id, 
-                reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "manage_projects" }]] } 
-            }
-        );
+        bot.editMessageText(`📝 **Update Mode: ${projName}**\n\nSend new files.`, { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "manage_projects" }]] } });
     }
-
     else if (data === "main_menu") {
         bot.editMessageText("🏠 Main Menu", { chat_id: chatId, message_id: query.message.message_id, reply_markup: getMainMenu(userId) });
     }
 });
 
-// ================= AUTO RESTORE =================
+// Auto Restore
 async function restoreProjects() {
     console.log("🔄 Restoring Projects...");
     const runningProjs = await projectsCol.find({ status: "Running" }).toArray();
     
     for (const proj of runningProjs) {
         const dir = path.join(__dirname, 'deployments', proj.user_id.toString(), proj.name);
-        
         if (!fs.existsSync(dir)) {
             console.log(`♻️ Rebuilding: ${proj.name}`);
             fs.mkdirSync(dir, { recursive: true });
-            
             if (proj.files) {
-                for (const file of proj.files) {
-                    fs.writeFileSync(path.join(dir, file.name), file.content.buffer);
-                }
+                for (const file of proj.files) fs.writeFileSync(path.join(dir, file.name), file.content.buffer);
             }
-            // Start quietly but ensure install happens if modules missing
             startProject(proj.user_id, proj.name, null, true);
         }
     }

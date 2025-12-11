@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ['git', 'nodejs', 'npm']
+nixPkgs = ['git', 'nodejs', 'npm', 'bash', 'coreutils']
 
 [phases.build]
 cmds = ['npm install']
