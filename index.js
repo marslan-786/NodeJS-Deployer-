@@ -18,6 +18,7 @@ let db, projectsCol, keysCol, usersCol;
 const ACTIVE_PROCESSES = {}; 
 const USER_STATE = {}; 
 const INTERACTIVE_SESSIONS = {}; 
+const SESSION_WATCHERS = {}; // To store file watchers
 
 // Connect DB
 async function connectDB() {
@@ -54,12 +55,7 @@ function getMainMenu(userId) {
     return { inline_keyboard: keyboard };
 }
 
-// 🔥 Helper to extract Full Project Name correctly
-// یہ فنکشن اب نام کو خراب نہیں ہونے دے گا چاہے اس میں کتنے بھی Underscore ہوں
 function getProjNameFromData(data, prefix) {
-    // data example: "menu_My_Super_Bot"
-    // prefix example: "menu_"
-    // Result: "My_Super_Bot"
     return data.substring(prefix.length);
 }
 
@@ -77,6 +73,66 @@ function installDependencies(basePath, chatId) {
     });
 }
 
+// 🔥 SESSION SYNC LOGIC (New Feature) 🔥
+function setupSessionSync(userId, projName, basePath) {
+    const sessionDir = path.join(basePath, 'session');
+    
+    // اگر فولڈر نہیں ہے تو بنا دیں
+    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+
+    // پرانے Watcher کو ختم کریں تاکہ ڈپلیکیٹ نہ ہو
+    const watcherId = `${userId}_${projName}`;
+    if (SESSION_WATCHERS[watcherId]) {
+        SESSION_WATCHERS[watcherId].close();
+    }
+
+    // فائلز پر نظر رکھیں
+    const watcher = fs.watch(sessionDir, async (eventType, filename) => {
+        if (filename && eventType === 'change') {
+            const filePath = path.join(sessionDir, filename);
+            // صرف تب سیو کریں جب فائل موجود ہو (Delete event نہ ہو)
+            if (fs.existsSync(filePath)) {
+                try {
+                    const content = fs.readFileSync(filePath);
+                    // MongoDB میں اپڈیٹ کریں (Using Dot Notation for specific file update)
+                    // ہم فائل کا نام key کے طور پر استعمال کریں گے لیکن ڈاٹ (.) ہٹا کر کیونکہ Mongo میں ڈاٹ key میں allowed نہیں
+                    // بیٹر طریقہ: Array میں سیو کریں یا Map
+                    
+                    // Simple Approach: Store inside 'session_data' object
+                    // We replace '.' with '_DOT_' to avoid Mongo Errors
+                    const safeKey = filename.replace(/\./g, '_DOT_');
+                    
+                    await projectsCol.updateOne(
+                        { user_id: userId, name: projName },
+                        { $set: { [`session_data.${safeKey}`]: content } }
+                    );
+                } catch (err) {
+                    console.error(`Session Save Error (${filename}):`, err.message);
+                }
+            }
+        }
+    });
+    
+    SESSION_WATCHERS[watcherId] = watcher;
+}
+
+// 🔥 SESSION RESTORE LOGIC 🔥
+async function restoreSessionFromDB(userId, projName, basePath) {
+    const project = await projectsCol.findOne({ user_id: userId, name: projName });
+    if (project && project.session_data) {
+        const sessionDir = path.join(basePath, 'session');
+        if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+
+        console.log(`♻️ Restoring Session for ${projName}...`);
+        
+        for (const [safeKey, content] of Object.entries(project.session_data)) {
+            // Revert _DOT_ back to .
+            const filename = safeKey.replace(/_DOT_/g, '.');
+            fs.writeFileSync(path.join(sessionDir, filename), content.buffer);
+        }
+    }
+}
+
 async function startProject(userId, projName, chatId, silent = false) {
     const basePath = path.join(__dirname, 'deployments', userId.toString(), projName);
     const projectId = `${userId}_${projName}`;
@@ -88,6 +144,7 @@ async function startProject(userId, projName, chatId, silent = false) {
 
     if (!silent && chatId) bot.sendMessage(chatId, `⏳ **Initializing ${projName}...**`);
 
+    // 1. Install Dependencies
     if (fs.existsSync(path.join(basePath, 'package.json'))) {
         try {
             if (!silent || !fs.existsSync(path.join(basePath, 'node_modules'))) {
@@ -96,6 +153,14 @@ async function startProject(userId, projName, chatId, silent = false) {
         } catch (err) { console.error(err); }
     }
 
+    // 2. 🔥 RESTORE SESSION BEFORE STARTING 🔥
+    try {
+        await restoreSessionFromDB(userId, projName, basePath);
+    } catch (e) {
+        console.error("Session Restore Failed:", e);
+    }
+
+    // 3. Start Process
     if (!silent && chatId) {
         bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Interactive Mode Active:**\nReply with Number/OTP. Logging will stop automatically after connection.`);
     }
@@ -109,11 +174,15 @@ async function startProject(userId, projName, chatId, silent = false) {
     ACTIVE_PROCESSES[projectId] = child;
     if (chatId) INTERACTIVE_SESSIONS[chatId] = projectId; 
 
+    // 4. 🔥 START WATCHING SESSION FILES FOR CHANGES 🔥
+    setupSessionSync(userId, projName, basePath);
+
     await projectsCol.updateOne(
         { user_id: userId, name: projName },
         { $set: { status: "Running", path: basePath } }
     );
 
+    // Logs Handling
     child.stdout.on('data', (data) => {
         const output = data.toString();
         
@@ -156,6 +225,10 @@ async function startProject(userId, projName, chatId, silent = false) {
     child.on('close', (code) => {
         delete ACTIVE_PROCESSES[projectId];
         if (INTERACTIVE_SESSIONS[chatId] === projectId) delete INTERACTIVE_SESSIONS[chatId];
+        
+        // Stop Watching Session
+        if (SESSION_WATCHERS[projectId]) SESSION_WATCHERS[projectId].close();
+
         projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
         if (chatId && !silent) bot.sendMessage(chatId, `🛑 **Bot Stopped** (Exit Code: ${code})`);
     });
@@ -241,7 +314,7 @@ bot.on('document', async (msg) => {
     }
 });
 
-// ================= FIXED CALLBACK HANDLING =================
+// ================= CALLBACK HANDLING =================
 
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
@@ -259,7 +332,6 @@ bot.on('callback_query', async (query) => {
         bot.editMessageText("📂 **Your Projects**", { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: keyboard } });
     }
     
-    // 🔥 FIXED: Project Name Parsing (Using Substring instead of Split[1]) 🔥
     else if (data.startsWith("menu_")) {
         const projName = getProjNameFromData(data, "menu_");
         const keyboard = [
@@ -276,10 +348,9 @@ bot.on('callback_query', async (query) => {
         if (ACTIVE_PROCESSES[projId]) {
             try { ACTIVE_PROCESSES[projId].kill(); } catch(e) {}
             delete ACTIVE_PROCESSES[projId];
+            if (SESSION_WATCHERS[projId]) SESSION_WATCHERS[projId].close(); // Stop Watcher
             await projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
             bot.answerCallbackQuery(query.id, { text: "Stopped" });
-            
-            // Refresh Menu
             const keyboard = [
                 [{ text: "🛑 Stop", callback_data: `stop_${projName}` }, { text: "▶️ Start", callback_data: `start_${projName}` }],
                 [{ text: "📝 Update Files", callback_data: `upd_${projName}` }, { text: "🗑️ Delete", callback_data: `del_${projName}` }],
@@ -302,20 +373,13 @@ bot.on('callback_query', async (query) => {
         const projId = `${userId}_${projName}`;
         try {
             if (ACTIVE_PROCESSES[projId]) { try { ACTIVE_PROCESSES[projId].kill(); } catch (e) {} delete ACTIVE_PROCESSES[projId]; }
-            
-            // Database Delete
+            if (SESSION_WATCHERS[projId]) SESSION_WATCHERS[projId].close();
             await projectsCol.deleteOne({ user_id: userId, name: projName });
-            
-            // Files Delete
             const dir = path.join(__dirname, 'deployments', userId.toString(), projName);
             if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-            
             bot.answerCallbackQuery(query.id, { text: "Deleted!" });
             bot.deleteMessage(chatId, query.message.message_id);
-        } catch (e) { 
-            console.log(e);
-            bot.answerCallbackQuery(query.id, { text: "Error deleting" }); 
-        }
+        } catch (e) { bot.answerCallbackQuery(query.id, { text: "Error deleting" }); }
     }
     
     else if (data.startsWith("upd_")) {
