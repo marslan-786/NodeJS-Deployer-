@@ -18,7 +18,7 @@ let db, projectsCol, keysCol, usersCol;
 const ACTIVE_PROCESSES = {}; 
 const USER_STATE = {}; 
 const INTERACTIVE_SESSIONS = {}; 
-const SESSION_WATCHERS = {}; // To store file watchers
+const SESSION_WATCHERS = {}; 
 
 // Connect DB
 async function connectDB() {
@@ -73,60 +73,40 @@ function installDependencies(basePath, chatId) {
     });
 }
 
-// 🔥 SESSION SYNC LOGIC (New Feature) 🔥
+// Session Sync Logic
 function setupSessionSync(userId, projName, basePath) {
     const sessionDir = path.join(basePath, 'session');
-    
-    // اگر فولڈر نہیں ہے تو بنا دیں
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
-    // پرانے Watcher کو ختم کریں تاکہ ڈپلیکیٹ نہ ہو
     const watcherId = `${userId}_${projName}`;
-    if (SESSION_WATCHERS[watcherId]) {
-        SESSION_WATCHERS[watcherId].close();
-    }
+    if (SESSION_WATCHERS[watcherId]) SESSION_WATCHERS[watcherId].close();
 
-    // فائلز پر نظر رکھیں
     const watcher = fs.watch(sessionDir, async (eventType, filename) => {
         if (filename && eventType === 'change') {
             const filePath = path.join(sessionDir, filename);
-            // صرف تب سیو کریں جب فائل موجود ہو (Delete event نہ ہو)
             if (fs.existsSync(filePath)) {
                 try {
                     const content = fs.readFileSync(filePath);
-                    // MongoDB میں اپڈیٹ کریں (Using Dot Notation for specific file update)
-                    // ہم فائل کا نام key کے طور پر استعمال کریں گے لیکن ڈاٹ (.) ہٹا کر کیونکہ Mongo میں ڈاٹ key میں allowed نہیں
-                    // بیٹر طریقہ: Array میں سیو کریں یا Map
-                    
-                    // Simple Approach: Store inside 'session_data' object
-                    // We replace '.' with '_DOT_' to avoid Mongo Errors
                     const safeKey = filename.replace(/\./g, '_DOT_');
-                    
                     await projectsCol.updateOne(
                         { user_id: userId, name: projName },
                         { $set: { [`session_data.${safeKey}`]: content } }
                     );
-                } catch (err) {
-                    console.error(`Session Save Error (${filename}):`, err.message);
-                }
+                } catch (err) { console.error(`Session Save Error:`, err.message); }
             }
         }
     });
-    
     SESSION_WATCHERS[watcherId] = watcher;
 }
 
-// 🔥 SESSION RESTORE LOGIC 🔥
+// Session Restore Logic
 async function restoreSessionFromDB(userId, projName, basePath) {
     const project = await projectsCol.findOne({ user_id: userId, name: projName });
     if (project && project.session_data) {
         const sessionDir = path.join(basePath, 'session');
         if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-
-        console.log(`♻️ Restoring Session for ${projName}...`);
         
         for (const [safeKey, content] of Object.entries(project.session_data)) {
-            // Revert _DOT_ back to .
             const filename = safeKey.replace(/_DOT_/g, '.');
             fs.writeFileSync(path.join(sessionDir, filename), content.buffer);
         }
@@ -144,7 +124,6 @@ async function startProject(userId, projName, chatId, silent = false) {
 
     if (!silent && chatId) bot.sendMessage(chatId, `⏳ **Initializing ${projName}...**`);
 
-    // 1. Install Dependencies
     if (fs.existsSync(path.join(basePath, 'package.json'))) {
         try {
             if (!silent || !fs.existsSync(path.join(basePath, 'node_modules'))) {
@@ -153,14 +132,8 @@ async function startProject(userId, projName, chatId, silent = false) {
         } catch (err) { console.error(err); }
     }
 
-    // 2. 🔥 RESTORE SESSION BEFORE STARTING 🔥
-    try {
-        await restoreSessionFromDB(userId, projName, basePath);
-    } catch (e) {
-        console.error("Session Restore Failed:", e);
-    }
+    try { await restoreSessionFromDB(userId, projName, basePath); } catch (e) {}
 
-    // 3. Start Process
     if (!silent && chatId) {
         bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Interactive Mode Active:**\nReply with Number/OTP. Logging will stop automatically after connection.`);
     }
@@ -174,7 +147,6 @@ async function startProject(userId, projName, chatId, silent = false) {
     ACTIVE_PROCESSES[projectId] = child;
     if (chatId) INTERACTIVE_SESSIONS[chatId] = projectId; 
 
-    // 4. 🔥 START WATCHING SESSION FILES FOR CHANGES 🔥
     setupSessionSync(userId, projName, basePath);
 
     await projectsCol.updateOne(
@@ -182,34 +154,39 @@ async function startProject(userId, projName, chatId, silent = false) {
         { $set: { status: "Running", path: basePath } }
     );
 
-    // Logs Handling
+    // 🔥 FIXED LOGGING SYSTEM 🔥
     child.stdout.on('data', (data) => {
         const output = data.toString();
         
         if (!INTERACTIVE_SESSIONS[chatId] || INTERACTIVE_SESSIONS[chatId] !== projectId) return;
 
-        if (output.includes("Connected Successfully") || 
-            output.includes("Bot Connected") || 
-            output.includes("Monitoring Service Starting") ||
-            output.includes("is now Online") ||
-            output.includes("✅")) {
-            
-            bot.sendMessage(chatId, `✅ **Success! Bot is Running.**\n\n🔇 *Live Logging Muted.*`);
-            delete INTERACTIVE_SESSIONS[chatId]; 
+        // 1. INPUT DETECTOR (Prioritize this!)
+        if (output.includes("Enter Number") || output.includes("Pairing Code") || output.includes("OTP")) {
+            bot.sendMessage(chatId, `⌨️ **Input Required:**\n\`${output.trim()}\``, { parse_mode: "Markdown" });
             return;
         }
 
+        // 2. PAIRING CODE DETECTOR
         const codeMatch = output.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/);
         if (codeMatch) {
             bot.sendMessage(chatId, `🔑 **YOUR PAIRING CODE:**\n\n\`${codeMatch[0]}\``, { parse_mode: "Markdown" });
             return;
         }
 
-        if (output.includes("Enter Number") || output.includes("Pairing Code")) {
-            bot.sendMessage(chatId, `⌨️ **Input Required:**\n\`${output.trim()}\``, { parse_mode: "Markdown" });
+        // 3. STRICT SUCCESS DETECTOR (Fix for false positives)
+        // میں نے یہاں سے ✅ ہٹا دیا ہے تاکہ وہ عام لاگز پر بند نہ ہو۔
+        // اب یہ صرف تب بند ہوگا جب واقعی واٹس ایپ کنیکٹ ہوگا۔
+        if (output.includes("Opened connection") || 
+            output.includes("Connection open") || 
+            output.includes("Bot Connected & Awake") ||
+            output.includes("Bot Connected Successfully")) {
+            
+            bot.sendMessage(chatId, `✅ **Success! Bot is Running.**\n\n🔇 *Live Logging Muted.*`);
+            delete INTERACTIVE_SESSIONS[chatId]; 
             return;
         }
 
+        // 4. GENERAL LOGS
         if (!output.includes("npm") && output.trim() !== "") {
              if(output.length < 300) bot.sendMessage(chatId, `🖥️ \`${output.trim()}\``, { parse_mode: "Markdown" });
         }
@@ -225,10 +202,7 @@ async function startProject(userId, projName, chatId, silent = false) {
     child.on('close', (code) => {
         delete ACTIVE_PROCESSES[projectId];
         if (INTERACTIVE_SESSIONS[chatId] === projectId) delete INTERACTIVE_SESSIONS[chatId];
-        
-        // Stop Watching Session
         if (SESSION_WATCHERS[projectId]) SESSION_WATCHERS[projectId].close();
-
         projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
         if (chatId && !silent) bot.sendMessage(chatId, `🛑 **Bot Stopped** (Exit Code: ${code})`);
     });
@@ -348,9 +322,10 @@ bot.on('callback_query', async (query) => {
         if (ACTIVE_PROCESSES[projId]) {
             try { ACTIVE_PROCESSES[projId].kill(); } catch(e) {}
             delete ACTIVE_PROCESSES[projId];
-            if (SESSION_WATCHERS[projId]) SESSION_WATCHERS[projId].close(); // Stop Watcher
+            if (SESSION_WATCHERS[projId]) SESSION_WATCHERS[projId].close();
             await projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
             bot.answerCallbackQuery(query.id, { text: "Stopped" });
+            
             const keyboard = [
                 [{ text: "🛑 Stop", callback_data: `stop_${projName}` }, { text: "▶️ Start", callback_data: `start_${projName}` }],
                 [{ text: "📝 Update Files", callback_data: `upd_${projName}` }, { text: "🗑️ Delete", callback_data: `del_${projName}` }],
