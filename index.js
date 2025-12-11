@@ -3,12 +3,11 @@ const { MongoClient } = require('mongodb');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const uuid = require('uuid');
 
 // ================= CONFIGURATION =================
-const TOKEN = "8452280797:AAEruS20yx0YCb2T8aHIZk8xjzRlLb6GDAk"; // اپنا بوٹ ٹوکن یہاں لکھیں
-const MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rlwy.net:29609"; // ریلوے والا MongoDB URL
-const OWNER_IDS = [8167904992, 7134046678]; // اپنی آئی ڈیز یہاں لکھیں
+const TOKEN = "8452280797:AAEruS20yx0YCb2T8aHIZk8xjzRlLb6GDAk"; // Bot Token
+const MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rlwy.net:29609"; // Mongo URL
+const OWNER_IDS = [8167904992, 7134046678]; // Owner IDs
 
 // ================= SETUP =================
 const bot = new TelegramBot(TOKEN, { polling: true });
@@ -17,7 +16,7 @@ let db, projectsCol, keysCol, usersCol;
 
 // Global Variables
 const ACTIVE_PROCESSES = {}; // stores running child processes
-const USER_STATE = {}; // stores user steps (uploading files etc)
+const USER_STATE = {}; // stores user steps
 const INTERACTIVE_SESSIONS = {}; // stores user mapping to process for input
 
 // Connect DB
@@ -29,7 +28,7 @@ async function connectDB() {
         keysCol = db.collection("access_keys");
         usersCol = db.collection("users");
         console.log("✅ Connected to MongoDB");
-        restoreProjects(); // Auto Restore on Start
+        restoreProjects(); 
     } catch (e) {
         console.error("❌ DB Error:", e);
     }
@@ -55,35 +54,68 @@ function getMainMenu(userId) {
     return { inline_keyboard: keyboard };
 }
 
-// ================= PROCESS MANAGEMENT (Terminal Logic) =================
+// ================= PROCESS MANAGEMENT =================
+
+// Helper to run NPM INSTALL strictly
+function installDependencies(basePath, chatId) {
+    return new Promise((resolve, reject) => {
+        if (!fs.existsSync(path.join(basePath, 'package.json'))) {
+            return resolve("No package.json, skipping install.");
+        }
+
+        bot.sendMessage(chatId, `📦 **Installing Dependencies...**\nPlease wait, this handles heavy libraries like Baileys.`);
+
+        const install = spawn('npm', ['install'], { cwd: basePath, shell: true });
+
+        // Capture error logs for debugging
+        let errorLog = "";
+        install.stderr.on('data', (data) => { errorLog += data.toString(); });
+
+        install.on('close', (code) => {
+            if (code === 0) {
+                resolve("Success");
+            } else {
+                reject(`NPM Install Failed (Code ${code})\n${errorLog.slice(0, 500)}...`);
+            }
+        });
+    });
+}
 
 async function startProject(userId, projName, chatId, silent = false) {
     const basePath = path.join(__dirname, 'deployments', userId.toString(), projName);
     const projectId = `${userId}_${projName}`;
 
-    if (!silent) bot.sendMessage(chatId, `⏳ **Initializing ${projName}...**`);
-
-    // 1. Install Dependencies
-    if (fs.existsSync(path.join(basePath, 'package.json'))) {
-        if (!silent) bot.sendMessage(chatId, `📦 **Installing NPM Modules...** (This may take time)`);
-        
-        const install = spawn('npm', ['install'], { cwd: basePath, shell: true });
-        
-        await new Promise((resolve) => {
-            install.on('close', (code) => resolve(code));
-        });
+    // 1. Check if process is already running
+    if (ACTIVE_PROCESSES[projectId]) {
+        if (!silent) bot.sendMessage(chatId, "⚠️ Bot is already running.");
+        return;
     }
 
-    // 2. Start Process
-    if (!silent) bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Interactive Mode Active:**\nIf the bot asks for Number/Code, just reply here.`);
+    if (!silent) bot.sendMessage(chatId, `⏳ **Initializing ${projName}...**`);
 
-    // Use 'spawn' to keep stdin/stdout open
-    // Assuming main file is index.js, change if needed
+    // 2. Strict Dependency Installation
+    // اگر فولڈر میں node_modules نہیں ہے یا یہ نئی ڈپلائمنٹ ہے تو انسٹال کرو
+    if (fs.existsSync(path.join(basePath, 'package.json'))) {
+        try {
+             // اگر silent (auto restore) ہے تو ہم دوبارہ انسٹال نہیں کرتے تاکہ ٹائم بچے، 
+             // مگر اگر node_modules غائب ہے (Railway Restart) تو کرنا پڑے گا۔
+            if (!silent || !fs.existsSync(path.join(basePath, 'node_modules'))) {
+                await installDependencies(basePath, chatId || OWNER_IDS[0]); 
+            }
+        } catch (err) {
+            if (chatId) bot.sendMessage(chatId, `❌ **Installation Error:**\n\`${err}\``, { parse_mode: "Markdown" });
+            return; // Stop here, do not run index.js
+        }
+    }
+
+    // 3. Start Process
+    if (!silent && chatId) {
+        bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Interactive Mode Active:**\nReply here to send input to terminal.`);
+    }
+
     const child = spawn('node', ['index.js'], { cwd: basePath, shell: true });
-
     ACTIVE_PROCESSES[projectId] = child;
     
-    // Map user chat to this process for Input Injection
     if (chatId) INTERACTIVE_SESSIONS[chatId] = projectId;
 
     // Update DB Status
@@ -92,29 +124,26 @@ async function startProject(userId, projName, chatId, silent = false) {
         { $set: { status: "Running", path: basePath } }
     );
 
-    // --- HANDLE LOGS (The WhatsApp Pairing Magic) ---
-    
+    // --- LOGS HANDLER ---
     child.stdout.on('data', (data) => {
         const output = data.toString();
-        // If interactive mode is active (user is watching), send logs to Telegram
-        if (chatId && INTERACTIVE_SESSIONS[chatId] === projectId) {
-            // Avoid sending empty logs
-            if (output.trim().length > 0) {
-                bot.sendMessage(chatId, `🖥️ **Terminal:**\n\`${output}\``, { parse_mode: "Markdown" });
-            }
+        if (chatId && INTERACTIVE_SESSIONS[chatId] === projectId && output.trim().length > 0) {
+            bot.sendMessage(chatId, `🖥️ **Terminal:**\n\`${output}\``, { parse_mode: "Markdown" });
         }
     });
 
     child.stderr.on('data', (data) => {
         const error = data.toString();
-        if (chatId && INTERACTIVE_SESSIONS[chatId] === projectId) {
-            bot.sendMessage(chatId, `⚠️ **Error Log:**\n\`${error}\``, { parse_mode: "Markdown" });
+        // Baileys often prints info logs in stderr, so filter real errors or show all
+        if (chatId && INTERACTIVE_SESSIONS[chatId] === projectId && error.trim().length > 0) {
+            // Optional: Filter out "Buffer" warnings or known non-fatal errors
+            bot.sendMessage(chatId, `⚠️ **Log:**\n\`${error}\``, { parse_mode: "Markdown" });
         }
     });
 
     child.on('close', (code) => {
         delete ACTIVE_PROCESSES[projectId];
-        if (INTERACTIVE_SESSIONS[chatId] === projectId) delete INTERACTIVE_SESSIONS[chatId];
+        if (chatId && INTERACTIVE_SESSIONS[chatId] === projectId) delete INTERACTIVE_SESSIONS[chatId];
         
         projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
         
@@ -126,29 +155,25 @@ async function startProject(userId, projName, chatId, silent = false) {
 
 // ================= MESSAGE HANDLERS =================
 
-// 1. Handle Text Input (Terminal Input & Menus)
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
     const text = msg.text;
 
-    // A. Check for Interactive Terminal Input
-    // اگر کوئی پروسیس چل رہا ہے اور ان پٹ مانگ رہا ہے
+    // A. Interactive Terminal Input
     if (INTERACTIVE_SESSIONS[chatId] && text && !text.startsWith("/")) {
         const projectId = INTERACTIVE_SESSIONS[chatId];
         const child = ACTIVE_PROCESSES[projectId];
         if (child) {
-            // Send user text to the running script
             child.stdin.write(text + "\n"); 
-            return; // Don't process other logic
+            return;
         }
     }
 
-    // B. Standard Logic
     if (!text) return;
 
+    // B. Start Command
     if (text.startsWith("/start")) {
-        // Auth Logic
         const args = text.split(" ");
         if (await isAuthorized(userId)) {
             bot.sendMessage(chatId, "👋 **Node.js Master Bot**\nTerminal Manager Ready.", { reply_markup: getMainMenu(userId) });
@@ -182,23 +207,24 @@ bot.on('message', async (msg) => {
                     keyboard: [[{ text: "✅ Done / Start Deploy" }]]
                 }
             };
-            bot.sendMessage(chatId, `✅ Name: **${projName}**\n\nSend your files (index.js, package.json etc).\nPress Done when finished.`, opts);
+            bot.sendMessage(chatId, `✅ Name: **${projName}**\n\nSend files (index.js, package.json).\nPress Done when finished.`, opts);
         }
         else if (text === "✅ Done / Start Deploy" && USER_STATE[userId].step === "wait_files") {
-            // Finish Upload
             const projName = USER_STATE[userId].name;
             delete USER_STATE[userId];
-            
-            bot.sendMessage(chatId, "⚙️ Starting Deployment...", { reply_markup: { remove_keyboard: true } });
+            bot.sendMessage(chatId, "⚙️ Processing...", { reply_markup: { remove_keyboard: true } });
             startProject(userId, projName, chatId);
         }
     }
 });
 
-// 2. Handle File Uploads
+// 2. Handle File Uploads (Deploy & Update)
 bot.on('document', async (msg) => {
     const userId = msg.from.id;
-    if (USER_STATE[userId] && USER_STATE[userId].step === "wait_files") {
+    
+    // Check if user is in 'wait_files' (New Deploy) OR 'update_files' (Manage)
+    if (USER_STATE[userId] && (USER_STATE[userId].step === "wait_files" || USER_STATE[userId].step === "update_files")) {
+        
         const projName = USER_STATE[userId].name;
         const fileName = msg.document.file_name;
         
@@ -207,35 +233,46 @@ bot.on('document', async (msg) => {
 
         const filePath = path.join(dir, fileName);
         
-        // Download
         const fileLink = await bot.getFileLink(msg.document.file_id);
         const response = await fetch(fileLink);
         const buffer = await response.arrayBuffer();
         fs.writeFileSync(filePath, Buffer.from(buffer));
 
-        // Save to DB (Persistence)
+        // DB Persistence Logic (Handles updates too)
+        // Remove old file entry if exists
+        await projectsCol.updateOne(
+            { user_id: userId, name: projName },
+            { $pull: { files: { name: fileName } } }
+        );
+        // Push new file entry
         await projectsCol.updateOne(
             { user_id: userId, name: projName },
             { $push: { files: { name: fileName, content: Buffer.from(buffer) } } },
             { upsert: true }
         );
 
-        bot.sendMessage(msg.chat.id, `📥 Received: \`${fileName}\``);
+        if (USER_STATE[userId].step === "update_files") {
+            bot.sendMessage(msg.chat.id, `🔄 **Updated:** \`${fileName}\`\nRestart bot to apply changes.`);
+        } else {
+            bot.sendMessage(msg.chat.id, `📥 Received: \`${fileName}\``);
+        }
     }
 });
 
-// ================= CALLBACK QUERIES (Menus) =================
+// ================= CALLBACK QUERIES =================
 
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const userId = query.from.id;
     const data = query.data;
 
+    // 1. Deploy New
     if (data === "deploy_new") {
         USER_STATE[userId] = { step: "ask_name" };
         bot.sendMessage(chatId, "📂 Enter Project Name (No spaces):");
     }
     
+    // 2. List Projects
     else if (data === "manage_projects") {
         const projects = await projectsCol.find({ user_id: userId }).toArray();
         const keyboard = projects.map(p => {
@@ -246,25 +283,28 @@ bot.on('callback_query', async (query) => {
         bot.editMessageText("📂 **Your Projects**", { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: keyboard } });
     }
 
+    // 3. Project Menu
     else if (data.startsWith("menu_")) {
         const projName = data.split("_")[1];
         const keyboard = [
             [
                 { text: "🛑 Stop", callback_data: `stop_${projName}` },
-                { text: "▶️ Start (Live)", callback_data: `start_${projName}` }
+                { text: "▶️ Start", callback_data: `start_${projName}` }
             ],
+            [{ text: "📝 Update Files", callback_data: `upd_${projName}` }],
             [{ text: "🗑️ Delete", callback_data: `del_${projName}` }],
             [{ text: "🔙 Back", callback_data: "manage_projects" }]
         ];
         bot.editMessageText(`⚙️ Manage: **${projName}**`, { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: keyboard } });
     }
 
+    // 4. Actions
     else if (data.startsWith("stop_")) {
         const projName = data.split("_")[1];
         const projId = `${userId}_${projName}`;
         if (ACTIVE_PROCESSES[projId]) {
             ACTIVE_PROCESSES[projId].kill();
-            bot.answerCallbackQuery(query.id, { text: "Process Stopped" });
+            bot.answerCallbackQuery(query.id, { text: "Stopped" });
         } else {
             bot.answerCallbackQuery(query.id, { text: "Already Stopped" });
         }
@@ -272,8 +312,45 @@ bot.on('callback_query', async (query) => {
 
     else if (data.startsWith("start_")) {
         const projName = data.split("_")[1];
-        bot.deleteMessage(chatId, query.message.message_id); // Clear menu to make space for logs
+        bot.deleteMessage(chatId, query.message.message_id); 
         startProject(userId, projName, chatId);
+    }
+
+    // --- FIX: DELETE LOGIC ---
+    else if (data.startsWith("del_")) {
+        const projName = data.split("_")[1];
+        const projId = `${userId}_${projName}`;
+        
+        // Stop if running
+        if (ACTIVE_PROCESSES[projId]) ACTIVE_PROCESSES[projId].kill();
+
+        // Delete from DB
+        await projectsCol.deleteOne({ user_id: userId, name: projName });
+
+        // Delete from Disk
+        const dir = path.join(__dirname, 'deployments', userId.toString(), projName);
+        if (fs.existsSync(dir)) {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+
+        bot.answerCallbackQuery(query.id, { text: "Project Deleted!" });
+        // Go back to list
+        bot.deleteMessage(chatId, query.message.message_id);
+    }
+
+    // --- FIX: UPDATE FILES LOGIC ---
+    else if (data.startsWith("upd_")) {
+        const projName = data.split("_")[1];
+        USER_STATE[userId] = { step: "update_files", name: projName };
+        
+        bot.editMessageText(
+            `📝 **Update Mode: ${projName}**\n\nSend new files (e.g. updated \`index.js\` or \`package.json\`).\nThey will replace existing ones automatically.`, 
+            { 
+                chat_id: chatId, 
+                message_id: query.message.message_id, 
+                reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "manage_projects" }]] } 
+            }
+        );
     }
 
     else if (data === "main_menu") {
@@ -298,7 +375,7 @@ async function restoreProjects() {
                     fs.writeFileSync(path.join(dir, file.name), file.content.buffer);
                 }
             }
-            // Start quietly without Telegram logs initially
+            // Start quietly but ensure install happens if modules missing
             startProject(proj.user_id, proj.name, null, true);
         }
     }
