@@ -135,7 +135,7 @@ async function startProject(userId, projName, chatId, silent = false) {
     try { await restoreSessionFromDB(userId, projName, basePath); } catch (e) {}
 
     if (!silent && chatId) {
-        bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Interactive Mode Active:**\nReply with Number/OTP. Logging will stop automatically after connection.`);
+        bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Interactive Mode Active:**\nReply with Number/OTP when asked.`);
     }
 
     const child = spawn('node', ['index.js'], { cwd: basePath, shell: true });
@@ -154,41 +154,48 @@ async function startProject(userId, projName, chatId, silent = false) {
         { $set: { status: "Running", path: basePath } }
     );
 
-    // 🔥 FIXED LOGGING SYSTEM 🔥
+    // 🔥 ULTIMATE CLEAN LOGGING SYSTEM 🔥
     child.stdout.on('data', (data) => {
-        const output = data.toString();
+        // 1. Raw Data String
+        const rawOutput = data.toString();
         
+        // 2. Clean ANSI Color Codes (یہ سب سے اہم لائن ہے)
+        // یہ [32m جیسے کوڈز کو ختم کر دے گا
+        const cleanOutput = rawOutput.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
+
         if (!INTERACTIVE_SESSIONS[chatId] || INTERACTIVE_SESSIONS[chatId] !== projectId) return;
 
-        // 1. INPUT DETECTOR (Prioritize this!)
-        if (output.includes("Enter Number") || output.includes("Pairing Code") || output.includes("OTP")) {
-            bot.sendMessage(chatId, `⌨️ **Input Required:**\n\`${output.trim()}\``, { parse_mode: "Markdown" });
-            return;
-        }
-
-        // 2. PAIRING CODE DETECTOR
-        const codeMatch = output.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/);
+        // --- PAIRING CODE DETECTOR (NOW ON CLEAN OUTPUT) ---
+        // پیٹرن: XXXX-XXXX (e.g., 154K-QG7M)
+        const codeMatch = cleanOutput.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/);
+        
         if (codeMatch) {
+            // صرف صاف کوڈ بھیجیں
             bot.sendMessage(chatId, `🔑 **YOUR PAIRING CODE:**\n\n\`${codeMatch[0]}\``, { parse_mode: "Markdown" });
             return;
         }
 
-        // 3. STRICT SUCCESS DETECTOR (Fix for false positives)
-        // میں نے یہاں سے ✅ ہٹا دیا ہے تاکہ وہ عام لاگز پر بند نہ ہو۔
-        // اب یہ صرف تب بند ہوگا جب واقعی واٹس ایپ کنیکٹ ہوگا۔
-        if (output.includes("Opened connection") || 
-            output.includes("Connection open") || 
-            output.includes("Bot Connected & Awake") ||
-            output.includes("Bot Connected Successfully")) {
+        // --- INPUT DETECTOR ---
+        if (cleanOutput.includes("Enter Number") || cleanOutput.includes("Pairing Code") || cleanOutput.includes("OTP")) {
+            bot.sendMessage(chatId, `⌨️ **Input Required:**\n\`${cleanOutput.trim()}\``, { parse_mode: "Markdown" });
+            return;
+        }
+
+        // --- SUCCESS DETECTOR ---
+        if (cleanOutput.includes("Opened connection") || 
+            cleanOutput.includes("Connection open") || 
+            cleanOutput.includes("Bot Connected") ||
+            cleanOutput.includes("Connected Successfully")) {
             
             bot.sendMessage(chatId, `✅ **Success! Bot is Running.**\n\n🔇 *Live Logging Muted.*`);
             delete INTERACTIVE_SESSIONS[chatId]; 
             return;
         }
 
-        // 4. GENERAL LOGS
-        if (!output.includes("npm") && output.trim() !== "") {
-             if(output.length < 300) bot.sendMessage(chatId, `🖥️ \`${output.trim()}\``, { parse_mode: "Markdown" });
+        // --- GENERAL LOGS (Only useful ones) ---
+        // NPM اور فالتو وارننگز فلٹر
+        if (!cleanOutput.includes("npm") && !cleanOutput.includes("update") && cleanOutput.trim() !== "") {
+             if(cleanOutput.length < 300) bot.sendMessage(chatId, `🖥️ \`${cleanOutput.trim()}\``, { parse_mode: "Markdown" });
         }
     });
 
