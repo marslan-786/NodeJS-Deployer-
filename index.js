@@ -17,7 +17,7 @@ let db, projectsCol, keysCol, usersCol;
 // Global Variables
 const ACTIVE_PROCESSES = {}; 
 const USER_STATE = {}; 
-const INTERACTIVE_SESSIONS = {}; // Stores which chat is receiving logs
+const INTERACTIVE_SESSIONS = {}; 
 
 // Connect DB
 async function connectDB() {
@@ -54,6 +54,15 @@ function getMainMenu(userId) {
     return { inline_keyboard: keyboard };
 }
 
+// 🔥 Helper to extract Full Project Name correctly
+// یہ فنکشن اب نام کو خراب نہیں ہونے دے گا چاہے اس میں کتنے بھی Underscore ہوں
+function getProjNameFromData(data, prefix) {
+    // data example: "menu_My_Super_Bot"
+    // prefix example: "menu_"
+    // Result: "My_Super_Bot"
+    return data.substring(prefix.length);
+}
+
 // ================= PROCESS MANAGEMENT =================
 
 function installDependencies(basePath, chatId) {
@@ -79,7 +88,6 @@ async function startProject(userId, projName, chatId, silent = false) {
 
     if (!silent && chatId) bot.sendMessage(chatId, `⏳ **Initializing ${projName}...**`);
 
-    // Install Dependencies
     if (fs.existsSync(path.join(basePath, 'package.json'))) {
         try {
             if (!silent || !fs.existsSync(path.join(basePath, 'node_modules'))) {
@@ -88,7 +96,6 @@ async function startProject(userId, projName, chatId, silent = false) {
         } catch (err) { console.error(err); }
     }
 
-    // Start Process
     if (!silent && chatId) {
         bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Interactive Mode Active:**\nReply with Number/OTP. Logging will stop automatically after connection.`);
     }
@@ -100,59 +107,47 @@ async function startProject(userId, projName, chatId, silent = false) {
     });
 
     ACTIVE_PROCESSES[projectId] = child;
-    if (chatId) INTERACTIVE_SESSIONS[chatId] = projectId; // Start listening to logs
+    if (chatId) INTERACTIVE_SESSIONS[chatId] = projectId; 
 
     await projectsCol.updateOne(
         { user_id: userId, name: projName },
         { $set: { status: "Running", path: basePath } }
     );
 
-    // 🔥 SMART LOGGING SYSTEM (AUTO MUTE) 🔥
     child.stdout.on('data', (data) => {
         const output = data.toString();
         
-        // اگر سیشن ایکٹو نہیں ہے (یعنی ہم نے میوٹ کر دیا ہے) تو کچھ مت بھیجو
         if (!INTERACTIVE_SESSIONS[chatId] || INTERACTIVE_SESSIONS[chatId] !== projectId) return;
 
-        // 1. SUCCESS DETECTOR (Auto Mute Logic)
-        // اگر یہ الفاظ نظر آئیں، تو سمجھو بوٹ چل گیا ہے اور لاگز بند کر دو
         if (output.includes("Connected Successfully") || 
             output.includes("Bot Connected") || 
             output.includes("Monitoring Service Starting") ||
             output.includes("is now Online") ||
             output.includes("✅")) {
             
-            bot.sendMessage(chatId, `✅ **Success! Bot is Running.**\n\n🔇 *Live Logging Muted to reduce spam.*`);
-            
-            // سیشن ختم کر دیں تاکہ مزید لاگز نہ جائیں
+            bot.sendMessage(chatId, `✅ **Success! Bot is Running.**\n\n🔇 *Live Logging Muted.*`);
             delete INTERACTIVE_SESSIONS[chatId]; 
             return;
         }
 
-        // 2. PAIRING CODE DETECTOR
         const codeMatch = output.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/);
         if (codeMatch) {
             bot.sendMessage(chatId, `🔑 **YOUR PAIRING CODE:**\n\n\`${codeMatch[0]}\``, { parse_mode: "Markdown" });
             return;
         }
 
-        // 3. INPUT PROMPTS
         if (output.includes("Enter Number") || output.includes("Pairing Code")) {
             bot.sendMessage(chatId, `⌨️ **Input Required:**\n\`${output.trim()}\``, { parse_mode: "Markdown" });
             return;
         }
 
-        // 4. GENERAL LOGS (صرف تب تک جائیں گے جب تک Mute نہیں ہوتا)
         if (!output.includes("npm") && output.trim() !== "") {
-             // اگر بہت زیادہ سپیم ہو رہا ہو تو یہ لائن کمنٹ کر سکتے ہیں
-             // لیکن کنکشن تک یوزر کو نظر آنا چاہیے کہ کیا ہو رہا ہے
              if(output.length < 300) bot.sendMessage(chatId, `🖥️ \`${output.trim()}\``, { parse_mode: "Markdown" });
         }
     });
 
     child.stderr.on('data', (data) => {
         const error = data.toString();
-        // Errors ہمیشہ بھیجیں، چاہے Mute ہی کیوں نہ ہو
         if (chatId && !error.includes("npm") && !error.includes("ExperimentalWarning")) {
              bot.sendMessage(chatId, `⚠️ **Error:**\n\`${error.slice(0, 200)}\``, { parse_mode: "Markdown" });
         }
@@ -173,7 +168,6 @@ bot.on('message', async (msg) => {
     const userId = msg.from.id;
     const text = msg.text;
 
-    // A. Interactive Input
     if (INTERACTIVE_SESSIONS[chatId] && text && !text.startsWith("/")) {
         const projectId = INTERACTIVE_SESSIONS[chatId];
         const child = ACTIVE_PROCESSES[projectId];
@@ -185,7 +179,6 @@ bot.on('message', async (msg) => {
 
     if (!text) return;
 
-    // B. Start Command
     if (text.startsWith("/start")) {
         const args = text.split(" ");
         if (await isAuthorized(userId)) {
@@ -204,7 +197,6 @@ bot.on('message', async (msg) => {
         }
     }
 
-    // C. Deploy Logic
     if (USER_STATE[userId]) {
         if (USER_STATE[userId].step === "ask_name") {
             const projName = text.trim().replace(/\s+/g, '_');
@@ -224,7 +216,6 @@ bot.on('message', async (msg) => {
     }
 });
 
-// File Uploads
 bot.on('document', async (msg) => {
     const userId = msg.from.id;
     if (USER_STATE[userId] && (USER_STATE[userId].step === "wait_files" || USER_STATE[userId].step === "update_files")) {
@@ -250,7 +241,8 @@ bot.on('document', async (msg) => {
     }
 });
 
-// Callbacks
+// ================= FIXED CALLBACK HANDLING =================
+
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const userId = query.from.id;
@@ -266,8 +258,10 @@ bot.on('callback_query', async (query) => {
         keyboard.push([{ text: "🔙 Back", callback_data: "main_menu" }]);
         bot.editMessageText("📂 **Your Projects**", { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: keyboard } });
     }
+    
+    // 🔥 FIXED: Project Name Parsing (Using Substring instead of Split[1]) 🔥
     else if (data.startsWith("menu_")) {
-        const projName = data.split("_")[1];
+        const projName = getProjNameFromData(data, "menu_");
         const keyboard = [
             [{ text: "🛑 Stop", callback_data: `stop_${projName}` }, { text: "▶️ Start", callback_data: `start_${projName}` }],
             [{ text: "📝 Update Files", callback_data: `upd_${projName}` }, { text: "🗑️ Delete", callback_data: `del_${projName}` }],
@@ -277,14 +271,15 @@ bot.on('callback_query', async (query) => {
     }
     
     else if (data.startsWith("stop_")) {
-        const projName = data.split("_")[1];
+        const projName = getProjNameFromData(data, "stop_");
         const projId = `${userId}_${projName}`;
         if (ACTIVE_PROCESSES[projId]) {
             try { ACTIVE_PROCESSES[projId].kill(); } catch(e) {}
             delete ACTIVE_PROCESSES[projId];
             await projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
             bot.answerCallbackQuery(query.id, { text: "Stopped" });
-            // Refresh
+            
+            // Refresh Menu
             const keyboard = [
                 [{ text: "🛑 Stop", callback_data: `stop_${projName}` }, { text: "▶️ Start", callback_data: `start_${projName}` }],
                 [{ text: "📝 Update Files", callback_data: `upd_${projName}` }, { text: "🗑️ Delete", callback_data: `del_${projName}` }],
@@ -297,29 +292,38 @@ bot.on('callback_query', async (query) => {
     }
     
     else if (data.startsWith("start_")) {
-        const projName = data.split("_")[1];
+        const projName = getProjNameFromData(data, "start_");
         bot.deleteMessage(chatId, query.message.message_id); 
         startProject(userId, projName, chatId);
     }
     
     else if (data.startsWith("del_")) {
-        const projName = data.split("_")[1];
+        const projName = getProjNameFromData(data, "del_");
         const projId = `${userId}_${projName}`;
         try {
             if (ACTIVE_PROCESSES[projId]) { try { ACTIVE_PROCESSES[projId].kill(); } catch (e) {} delete ACTIVE_PROCESSES[projId]; }
+            
+            // Database Delete
             await projectsCol.deleteOne({ user_id: userId, name: projName });
+            
+            // Files Delete
             const dir = path.join(__dirname, 'deployments', userId.toString(), projName);
             if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+            
             bot.answerCallbackQuery(query.id, { text: "Deleted!" });
             bot.deleteMessage(chatId, query.message.message_id);
-        } catch (e) { bot.answerCallbackQuery(query.id, { text: "Error deleting" }); }
+        } catch (e) { 
+            console.log(e);
+            bot.answerCallbackQuery(query.id, { text: "Error deleting" }); 
+        }
     }
     
     else if (data.startsWith("upd_")) {
-        const projName = data.split("_")[1];
+        const projName = getProjNameFromData(data, "upd_");
         USER_STATE[userId] = { step: "update_files", name: projName };
         bot.editMessageText(`📝 **Update Mode: ${projName}**\n\nSend new files.`, { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "manage_projects" }]] } });
     }
+
     else if (data === "main_menu") {
         bot.editMessageText("🏠 Main Menu", { chat_id: chatId, message_id: query.message.message_id, reply_markup: getMainMenu(userId) });
     }
