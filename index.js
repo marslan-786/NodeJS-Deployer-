@@ -59,6 +59,34 @@ function getProjNameFromData(data, prefix) {
     return data.substring(prefix.length);
 }
 
+// 🔥 FORCE STOP FUNCTION (Fixes Zombie Processes) 🔥
+async function forceStopProject(userId, projName) {
+    const projectId = `${userId}_${projName}`;
+    
+    // 1. Kill the Process
+    if (ACTIVE_PROCESSES[projectId]) {
+        try {
+            // SIGKILL ensures the process dies immediately
+            ACTIVE_PROCESSES[projectId].kill('SIGKILL'); 
+        } catch (e) {
+            console.error(`Kill Error: ${e.message}`);
+        }
+        delete ACTIVE_PROCESSES[projectId];
+    }
+
+    // 2. Stop Session Watcher
+    if (SESSION_WATCHERS[projectId]) {
+        SESSION_WATCHERS[projectId].close();
+        delete SESSION_WATCHERS[projectId];
+    }
+
+    // 3. Update DB Status
+    await projectsCol.updateOne(
+        { user_id: userId, name: projName }, 
+        { $set: { status: "Stopped" } }
+    );
+}
+
 // ================= PROCESS MANAGEMENT =================
 
 function installDependencies(basePath, chatId) {
@@ -73,7 +101,6 @@ function installDependencies(basePath, chatId) {
     });
 }
 
-// Session Sync Logic
 function setupSessionSync(userId, projName, basePath) {
     const sessionDir = path.join(basePath, 'session');
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
@@ -99,7 +126,6 @@ function setupSessionSync(userId, projName, basePath) {
     SESSION_WATCHERS[watcherId] = watcher;
 }
 
-// Session Restore Logic
 async function restoreSessionFromDB(userId, projName, basePath) {
     const project = await projectsCol.findOne({ user_id: userId, name: projName });
     if (project && project.session_data) {
@@ -117,9 +143,9 @@ async function startProject(userId, projName, chatId, silent = false) {
     const basePath = path.join(__dirname, 'deployments', userId.toString(), projName);
     const projectId = `${userId}_${projName}`;
 
+    // Ensure previous instance is dead before starting new one
     if (ACTIVE_PROCESSES[projectId]) {
-        if (!silent && chatId) bot.sendMessage(chatId, "⚠️ Bot is already running.");
-        return;
+        await forceStopProject(userId, projName);
     }
 
     if (!silent && chatId) bot.sendMessage(chatId, `⏳ **Initializing ${projName}...**`);
@@ -138,7 +164,9 @@ async function startProject(userId, projName, chatId, silent = false) {
         bot.sendMessage(chatId, `🚀 **Starting App...**\n\n🔴 **Interactive Mode Active:**\nReply with Number/OTP when asked.`);
     }
 
-    const child = spawn('node', ['index.js'], { cwd: basePath, shell: true });
+    // 🔥 FIX: REMOVED 'shell: true' TO FIX ZOMBIE PROCESSES 🔥
+    // اس سے اب پروسیس صحیح سے Kill ہوگا
+    const child = spawn('node', ['index.js'], { cwd: basePath, stdio: ['pipe', 'pipe', 'pipe'] });
 
     child.on('error', (err) => {
         if (chatId) bot.sendMessage(chatId, `❌ **System Error:**\n${err.message}`);
@@ -154,34 +182,24 @@ async function startProject(userId, projName, chatId, silent = false) {
         { $set: { status: "Running", path: basePath } }
     );
 
-    // 🔥 ULTIMATE CLEAN LOGGING SYSTEM 🔥
+    // Logging System
     child.stdout.on('data', (data) => {
-        // 1. Raw Data String
         const rawOutput = data.toString();
-        
-        // 2. Clean ANSI Color Codes (یہ سب سے اہم لائن ہے)
-        // یہ [32m جیسے کوڈز کو ختم کر دے گا
         const cleanOutput = rawOutput.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
 
         if (!INTERACTIVE_SESSIONS[chatId] || INTERACTIVE_SESSIONS[chatId] !== projectId) return;
 
-        // --- PAIRING CODE DETECTOR (NOW ON CLEAN OUTPUT) ---
-        // پیٹرن: XXXX-XXXX (e.g., 154K-QG7M)
         const codeMatch = cleanOutput.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/);
-        
         if (codeMatch) {
-            // صرف صاف کوڈ بھیجیں
             bot.sendMessage(chatId, `🔑 **YOUR PAIRING CODE:**\n\n\`${codeMatch[0]}\``, { parse_mode: "Markdown" });
             return;
         }
 
-        // --- INPUT DETECTOR ---
         if (cleanOutput.includes("Enter Number") || cleanOutput.includes("Pairing Code") || cleanOutput.includes("OTP")) {
             bot.sendMessage(chatId, `⌨️ **Input Required:**\n\`${cleanOutput.trim()}\``, { parse_mode: "Markdown" });
             return;
         }
 
-        // --- SUCCESS DETECTOR ---
         if (cleanOutput.includes("Opened connection") || 
             cleanOutput.includes("Connection open") || 
             cleanOutput.includes("Bot Connected") ||
@@ -192,8 +210,6 @@ async function startProject(userId, projName, chatId, silent = false) {
             return;
         }
 
-        // --- GENERAL LOGS (Only useful ones) ---
-        // NPM اور فالتو وارننگز فلٹر
         if (!cleanOutput.includes("npm") && !cleanOutput.includes("update") && cleanOutput.trim() !== "") {
              if(cleanOutput.length < 300) bot.sendMessage(chatId, `🖥️ \`${cleanOutput.trim()}\``, { parse_mode: "Markdown" });
         }
@@ -207,11 +223,14 @@ async function startProject(userId, projName, chatId, silent = false) {
     });
 
     child.on('close', (code) => {
-        delete ACTIVE_PROCESSES[projectId];
-        if (INTERACTIVE_SESSIONS[chatId] === projectId) delete INTERACTIVE_SESSIONS[chatId];
-        if (SESSION_WATCHERS[projectId]) SESSION_WATCHERS[projectId].close();
-        projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
-        if (chatId && !silent) bot.sendMessage(chatId, `🛑 **Bot Stopped** (Exit Code: ${code})`);
+        // Only notify if we didn't force stop it manually
+        if (ACTIVE_PROCESSES[projectId]) {
+            delete ACTIVE_PROCESSES[projectId];
+            if (INTERACTIVE_SESSIONS[chatId] === projectId) delete INTERACTIVE_SESSIONS[chatId];
+            if (SESSION_WATCHERS[projectId]) SESSION_WATCHERS[projectId].close();
+            projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
+            if (chatId && !silent) bot.sendMessage(chatId, `🛑 **Bot Stopped** (Exit Code: ${code})`);
+        }
     });
 }
 
@@ -272,6 +291,8 @@ bot.on('message', async (msg) => {
 
 bot.on('document', async (msg) => {
     const userId = msg.from.id;
+    
+    // Check for both New Deploy AND Update Mode
     if (USER_STATE[userId] && (USER_STATE[userId].step === "wait_files" || USER_STATE[userId].step === "update_files")) {
         const projName = USER_STATE[userId].name;
         const fileName = msg.document.file_name;
@@ -287,8 +308,18 @@ bot.on('document', async (msg) => {
         await projectsCol.updateOne({ user_id: userId, name: projName }, { $pull: { files: { name: fileName } } });
         await projectsCol.updateOne({ user_id: userId, name: projName }, { $push: { files: { name: fileName, content: Buffer.from(buffer) } } }, { upsert: true });
 
+        // 🔥 FIXED UPDATE LOGIC 🔥
         if (USER_STATE[userId].step === "update_files") {
-            bot.sendMessage(msg.chat.id, `🔄 **Updated:** \`${fileName}\`\nRestart bot to apply changes.`);
+            bot.sendMessage(msg.chat.id, `🔄 **Updated:** \`${fileName}\`\n\n🛑 Stopping old process...\n🚀 Restarting with new code...`);
+            
+            // 1. Force Stop
+            await forceStopProject(userId, projName);
+            
+            // 2. Start Again
+            startProject(userId, projName, msg.chat.id);
+            
+            // Clear state so user doesn't keep uploading
+            delete USER_STATE[userId]; 
         } else {
             bot.sendMessage(msg.chat.id, `📥 Received: \`${fileName}\``);
         }
@@ -325,23 +356,19 @@ bot.on('callback_query', async (query) => {
     
     else if (data.startsWith("stop_")) {
         const projName = getProjNameFromData(data, "stop_");
-        const projId = `${userId}_${projName}`;
-        if (ACTIVE_PROCESSES[projId]) {
-            try { ACTIVE_PROCESSES[projId].kill(); } catch(e) {}
-            delete ACTIVE_PROCESSES[projId];
-            if (SESSION_WATCHERS[projId]) SESSION_WATCHERS[projId].close();
-            await projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
-            bot.answerCallbackQuery(query.id, { text: "Stopped" });
-            
-            const keyboard = [
-                [{ text: "🛑 Stop", callback_data: `stop_${projName}` }, { text: "▶️ Start", callback_data: `start_${projName}` }],
-                [{ text: "📝 Update Files", callback_data: `upd_${projName}` }, { text: "🗑️ Delete", callback_data: `del_${projName}` }],
-                [{ text: "🔙 Back", callback_data: "manage_projects" }]
-            ];
-            bot.editMessageReplyMarkup({ inline_keyboard: keyboard }, { chat_id: chatId, message_id: query.message.message_id });
-        } else {
-            bot.answerCallbackQuery(query.id, { text: "Already Stopped" });
-        }
+        
+        // 🔥 USE FORCE STOP FUNCTION 🔥
+        await forceStopProject(userId, projName);
+        
+        bot.answerCallbackQuery(query.id, { text: "Stopped Successfully!" });
+        
+        // Refresh Menu
+        const keyboard = [
+            [{ text: "🛑 Stop", callback_data: `stop_${projName}` }, { text: "▶️ Start", callback_data: `start_${projName}` }],
+            [{ text: "📝 Update Files", callback_data: `upd_${projName}` }, { text: "🗑️ Delete", callback_data: `del_${projName}` }],
+            [{ text: "🔙 Back", callback_data: "manage_projects" }]
+        ];
+        bot.editMessageReplyMarkup({ inline_keyboard: keyboard }, { chat_id: chatId, message_id: query.message.message_id });
     }
     
     else if (data.startsWith("start_")) {
@@ -354,8 +381,7 @@ bot.on('callback_query', async (query) => {
         const projName = getProjNameFromData(data, "del_");
         const projId = `${userId}_${projName}`;
         try {
-            if (ACTIVE_PROCESSES[projId]) { try { ACTIVE_PROCESSES[projId].kill(); } catch (e) {} delete ACTIVE_PROCESSES[projId]; }
-            if (SESSION_WATCHERS[projId]) SESSION_WATCHERS[projId].close();
+            await forceStopProject(userId, projName); // Stop first
             await projectsCol.deleteOne({ user_id: userId, name: projName });
             const dir = path.join(__dirname, 'deployments', userId.toString(), projName);
             if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
@@ -367,7 +393,7 @@ bot.on('callback_query', async (query) => {
     else if (data.startsWith("upd_")) {
         const projName = getProjNameFromData(data, "upd_");
         USER_STATE[userId] = { step: "update_files", name: projName };
-        bot.editMessageText(`📝 **Update Mode: ${projName}**\n\nSend new files.`, { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "manage_projects" }]] } });
+        bot.editMessageText(`📝 **Update Mode: ${projName}**\n\nSend new files.\nBot will Auto-Restart after upload.`, { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "manage_projects" }]] } });
     }
 
     else if (data === "main_menu") {
