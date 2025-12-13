@@ -3,7 +3,7 @@ const { MongoClient } = require('mongodb');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const readline = require('readline');
+const uuid = require('uuid'); // UUID for keys
 
 // ================= CONFIGURATION =================
 const TOKEN = "8452280797:AAEruS20yx0YCb2T8aHIZk8xjzRlLb6GDAk"; 
@@ -49,10 +49,9 @@ connectDB();
 
 // ================= HELPER FUNCTIONS =================
 
-// 🔥 FINAL FIX: Strict Escaping for EVERYTHING (Dots, dashes, brackets etc.)
 function escapeMarkdown(text) {
     if (!text) return "";
-    return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+    return text.toString().replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
 
 async function isAuthorized(userId) {
@@ -87,11 +86,8 @@ async function safeEditMessage(chatId, messageId, text, keyboard) {
             parse_mode: 'MarkdownV2'
         });
     } catch (error) {
-        // Ignore known benign errors
         const errMsg = error.message;
         if (errMsg.includes('message is not modified') || errMsg.includes('message to edit not found')) return;
-        
-        // If edit fails, try sending new
         try {
             await bot.sendMessage(chatId, text, {
                 reply_markup: { inline_keyboard: keyboard },
@@ -176,8 +172,6 @@ async function startProject(userId, projName, chatId, silent = false) {
     const projectId = `${userId}_${projName}`;
 
     await forceStopProject(userId, projName);
-
-    // Escape Name for Telegram
     const safeName = escapeMarkdown(projName);
 
     if (!silent && chatId) bot.sendMessage(chatId, `⏳ *Initializing ${safeName}\\.\\.\\.*`, { parse_mode: 'MarkdownV2' }).catch(e => {});
@@ -233,8 +227,7 @@ async function startProject(userId, projName, chatId, silent = false) {
 
         if (!cleanOutput.includes("npm") && cleanOutput.trim() !== "") {
              if(cleanOutput.length < 300) {
-                 // 🔥 Apply Strict Escaping to Logs to avoid "." error
-                 bot.sendMessage(chatId, `🖥️ \`${escapeMarkdown(cleanOutput.trim())}\``, { parse_mode: "MarkdownV2" }).catch(e => console.log(e.message));
+                 bot.sendMessage(chatId, `🖥️ \`${escapeMarkdown(cleanOutput.trim())}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
              }
         }
     });
@@ -243,7 +236,6 @@ async function startProject(userId, projName, chatId, silent = false) {
         logStream.write(data);
         const error = data.toString();
         if (ACTIVE_SESSIONS[projectId] && ACTIVE_SESSIONS[projectId].logging && chatId && !error.includes("npm")) {
-             // 🔥 Apply Strict Escaping to Errors
              bot.sendMessage(chatId, `⚠️ *Error:*\n\`${escapeMarkdown(error.slice(0, 200))}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
         }
     });
@@ -269,7 +261,6 @@ bot.on('message', async (msg) => {
         const userId = msg.from.id;
         const text = msg.text;
 
-        // Interactive Input Logic
         let targetProjId = null;
         for (const [pid, session] of Object.entries(ACTIVE_SESSIONS)) {
             if (session.chatId === chatId && session.logging) {
@@ -298,7 +289,6 @@ bot.on('message', async (msg) => {
         if (USER_STATE[userId]) {
             if (USER_STATE[userId].step === "ask_name") {
                 const projName = text.trim().replace(/\s+/g, '_').replace(/[^\w-]/g, '');
-                
                 const exists = await projectsCol.findOne({ user_id: userId, name: projName });
                 if (exists) return bot.sendMessage(chatId, "❌ Name taken.").catch(e => {});
 
@@ -357,7 +347,74 @@ bot.on('callback_query', async (query) => {
     try {
         await bot.answerCallbackQuery(query.id).catch(err => {});
 
-        if (data === "deploy_new") {
+        // --- OWNER PANEL START ---
+        if (data === "owner_panel") {
+            if (!OWNER_IDS.includes(userId)) return bot.sendMessage(chatId, "⛔ Access Denied");
+            const keyboard = [
+                [{ text: "🔑 Generate Key", callback_data: "gen_key" }],
+                [{ text: "📜 List Keys", callback_data: "list_keys" }],
+                [{ text: "🔙 Back", callback_data: "main_menu" }]
+            ];
+            await safeEditMessage(chatId, messageId, "👑 *Owner Panel*", keyboard);
+        }
+
+        else if (data === "gen_key") {
+            const newKey = uuid.v4().split('-')[0];
+            await keysCol.insertOne({ key: newKey, status: "active", created_by: userId });
+            const keyboard = [[{ text: "🔙 Back", callback_data: "owner_panel" }]];
+            await safeEditMessage(chatId, messageId, `✅ *Key Generated:*\n\`${newKey}\`\n\nCommand: \`/start ${newKey}\``, keyboard);
+        }
+
+        else if (data === "list_keys") {
+            const keys = await keysCol.find({}).toArray();
+            if (keys.length === 0) {
+                await safeEditMessage(chatId, messageId, "⚠️ *No Keys Found*", [[{ text: "🔙 Back", callback_data: "owner_panel" }]]);
+                return;
+            }
+            const keyboard = keys.map(k => [{
+                text: `${k.status === 'active' ? '🟢' : '🔴'} ${k.key}`,
+                callback_data: `view_key_${k.key}`
+            }]);
+            keyboard.push([{ text: "🔙 Back", callback_data: "owner_panel" }]);
+            await safeEditMessage(chatId, messageId, "📜 *Manage Keys:*", keyboard);
+        }
+
+        else if (data.startsWith("view_key_")) {
+            const keyStr = data.replace("view_key_", "");
+            const keyDoc = await keysCol.findOne({ key: keyStr });
+            if (!keyDoc) return bot.sendMessage(chatId, "❌ Key not found");
+
+            const statusText = keyDoc.status === 'active' ? "Active 🟢" : "Inactive 🔴";
+            const usedBy = keyDoc.used_by ? `\`${keyDoc.used_by}\`` : "_Not Used_";
+
+            const keyboard = [
+                [{ text: "🔄 Toggle Status", callback_data: `tog_key_${keyStr}` }],
+                [{ text: "🗑️ Delete Key", callback_data: `del_key_${keyStr}` }],
+                [{ text: "🔙 Back", callback_data: "list_keys" }]
+            ];
+            await safeEditMessage(chatId, messageId, `🔑 *Key:* \`${escapeMarkdown(keyStr)}\`\n📊 *Status:* ${statusText}\n👤 *Used By:* ${usedBy}`, keyboard);
+        }
+
+        else if (data.startsWith("tog_key_")) {
+            const keyStr = data.replace("tog_key_", "");
+            const keyDoc = await keysCol.findOne({ key: keyStr });
+            if (keyDoc) {
+                const newStatus = keyDoc.status === 'active' ? 'inactive' : 'active';
+                await keysCol.updateOne({ key: keyStr }, { $set: { status: newStatus } });
+                // Refresh view
+                bot.emit('callback_query', { ...query, data: `view_key_${keyStr}` });
+            }
+        }
+
+        else if (data.startsWith("del_key_")) {
+            const keyStr = data.replace("del_key_", "");
+            await keysCol.deleteOne({ key: keyStr });
+            // Go back to list
+            bot.emit('callback_query', { ...query, data: "list_keys" });
+        }
+        // --- OWNER PANEL END ---
+
+        else if (data === "deploy_new") {
             USER_STATE[userId] = { step: "ask_name" };
             bot.sendMessage(chatId, "📂 Enter Project Name (No spaces):").catch(e => {});
         }
@@ -408,7 +465,6 @@ bot.on('callback_query', async (query) => {
         else if (data.startsWith("toggle_log_")) {
             const projName = getProjNameFromData(data, "toggle_log_");
             const projectId = `${userId}_${projName}`;
-            
             if (ACTIVE_SESSIONS[projectId]) ACTIVE_SESSIONS[projectId].logging = !ACTIVE_SESSIONS[projectId].logging;
             bot.emit('callback_query', { ...query, data: `menu_${projName}` });
         }
@@ -428,7 +484,6 @@ bot.on('callback_query', async (query) => {
                 await projectsCol.deleteOne({ user_id: userId, name: projName });
                 const dir = path.join(__dirname, 'deployments', userId.toString(), projName);
                 if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-                
                 await bot.deleteMessage(chatId, messageId).catch(e => {});
                 bot.sendMessage(chatId, "✅ Project Deleted!").catch(e => {});
             } catch (e) { bot.sendMessage(chatId, "❌ Delete Error").catch(e => {}); }
