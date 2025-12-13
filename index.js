@@ -11,7 +11,6 @@ const MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.pr
 const OWNER_IDS = [8167904992, 7134046678, 6022286935]; 
 
 // ================= SETUP =================
-// Polling fix added to handle conflicts better
 const bot = new TelegramBot(TOKEN, { 
     polling: {
         interval: 300,
@@ -50,7 +49,7 @@ connectDB();
 
 // ================= HELPER FUNCTIONS =================
 
-// 🔥 NEW: Fixes "Can't find end of entity" Error
+// 🔥 FINAL FIX: Strict Escaping for EVERYTHING (Dots, dashes, brackets etc.)
 function escapeMarkdown(text) {
     if (!text) return "";
     return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
@@ -75,9 +74,8 @@ function getMainMenu(userId) {
     return { inline_keyboard: keyboard };
 }
 
-// 🔥 NEW: Better Parsing to handle names with underscores
 function getProjNameFromData(data, prefix) {
-    return data.replace(prefix, ""); // Using replace ensures we get the FULL remaining string
+    return data.replace(prefix, ""); 
 }
 
 async function safeEditMessage(chatId, messageId, text, keyboard) {
@@ -86,12 +84,14 @@ async function safeEditMessage(chatId, messageId, text, keyboard) {
             chat_id: chatId,
             message_id: messageId,
             reply_markup: { inline_keyboard: keyboard },
-            parse_mode: 'MarkdownV2' // Changed to V2 for better escaping support
+            parse_mode: 'MarkdownV2'
         });
     } catch (error) {
+        // Ignore known benign errors
         const errMsg = error.message;
         if (errMsg.includes('message is not modified') || errMsg.includes('message to edit not found')) return;
         
+        // If edit fails, try sending new
         try {
             await bot.sendMessage(chatId, text, {
                 reply_markup: { inline_keyboard: keyboard },
@@ -108,7 +108,7 @@ function installDependencies(basePath, chatId) {
         if (!fs.existsSync(path.join(basePath, 'package.json'))) {
             return resolve("No package.json, skipping install.");
         }
-        if(chatId) bot.sendMessage(chatId, `📦 **Installing Dependencies...**`, { parse_mode: 'Markdown' }).catch(e => {});
+        if(chatId) bot.sendMessage(chatId, `📦 *Installing Dependencies\\.\\.\\.*`, { parse_mode: 'MarkdownV2' }).catch(e => {});
         const install = spawn('npm', ['install'], { cwd: basePath, shell: true });
         install.on('error', (err) => reject(`System Error: ${err.message}`));
         install.on('close', (code) => code === 0 ? resolve("Success") : resolve("Warning: Install issue"));
@@ -177,7 +177,10 @@ async function startProject(userId, projName, chatId, silent = false) {
 
     await forceStopProject(userId, projName);
 
-    if (!silent && chatId) bot.sendMessage(chatId, `⏳ *Initializing ${escapeMarkdown(projName)}...*`, { parse_mode: 'MarkdownV2' }).catch(e => {});
+    // Escape Name for Telegram
+    const safeName = escapeMarkdown(projName);
+
+    if (!silent && chatId) bot.sendMessage(chatId, `⏳ *Initializing ${safeName}\\.\\.\\.*`, { parse_mode: 'MarkdownV2' }).catch(e => {});
 
     if (fs.existsSync(path.join(basePath, 'package.json'))) {
         try {
@@ -190,7 +193,7 @@ async function startProject(userId, projName, chatId, silent = false) {
     try { await restoreSessionFromDB(userId, projName, basePath); } catch (e) {}
 
     if (!silent && chatId) {
-        bot.sendMessage(chatId, `🚀 *Starting App...*\n\n🔴 *Live Logging Active:*\nWait for pairing code...`, { parse_mode: 'MarkdownV2' }).catch(e => {});
+        bot.sendMessage(chatId, `🚀 *Starting App\\.\\.\\.*\n\n🔴 *Live Logging Active:*\nWait for pairing code\\.\\.\\.`, { parse_mode: 'MarkdownV2' }).catch(e => {});
     }
 
     const child = spawn('node', ['index.js'], { cwd: basePath, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -223,13 +226,16 @@ async function startProject(userId, projName, chatId, silent = false) {
         }
 
         if (cleanOutput.includes("Opened connection") || cleanOutput.includes("Connected Successfully")) {
-            bot.sendMessage(chatId, `✅ *Success! Bot is Online.*\n\n🔇 _Live Logging Disabled._`, { parse_mode: "MarkdownV2" }).catch(e => {});
+            bot.sendMessage(chatId, `✅ *Success\\! Bot is Online\\.*\n\n🔇 _Live Logging Disabled\\._`, { parse_mode: "MarkdownV2" }).catch(e => {});
             if (ACTIVE_SESSIONS[projectId]) ACTIVE_SESSIONS[projectId].logging = false;
             return;
         }
 
         if (!cleanOutput.includes("npm") && cleanOutput.trim() !== "") {
-             if(cleanOutput.length < 300) bot.sendMessage(chatId, `🖥️ \`${escapeMarkdown(cleanOutput.trim())}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
+             if(cleanOutput.length < 300) {
+                 // 🔥 Apply Strict Escaping to Logs to avoid "." error
+                 bot.sendMessage(chatId, `🖥️ \`${escapeMarkdown(cleanOutput.trim())}\``, { parse_mode: "MarkdownV2" }).catch(e => console.log(e.message));
+             }
         }
     });
 
@@ -237,6 +243,7 @@ async function startProject(userId, projName, chatId, silent = false) {
         logStream.write(data);
         const error = data.toString();
         if (ACTIVE_SESSIONS[projectId] && ACTIVE_SESSIONS[projectId].logging && chatId && !error.includes("npm")) {
+             // 🔥 Apply Strict Escaping to Errors
              bot.sendMessage(chatId, `⚠️ *Error:*\n\`${escapeMarkdown(error.slice(0, 200))}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
         }
     });
@@ -250,7 +257,7 @@ async function startProject(userId, projName, chatId, silent = false) {
         
         projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
         
-        if (chatId && !silent) bot.sendMessage(chatId, `🛑 *Bot Stopped* (Exit Code: ${code})`, { parse_mode: "MarkdownV2" }).catch(e => {});
+        if (chatId && !silent) bot.sendMessage(chatId, `🛑 *Bot Stopped* \\(Exit Code: ${code}\\)`, { parse_mode: "MarkdownV2" }).catch(e => {});
     });
 }
 
@@ -282,15 +289,14 @@ bot.on('message', async (msg) => {
 
         if (text.startsWith("/start")) {
             if (await isAuthorized(userId)) {
-                bot.sendMessage(chatId, "👋 *Node.js Master Bot*", { reply_markup: getMainMenu(userId), parse_mode: 'MarkdownV2' }).catch(e => {});
+                bot.sendMessage(chatId, "👋 *Node\\.js Master Bot*", { reply_markup: getMainMenu(userId), parse_mode: 'MarkdownV2' }).catch(e => {});
             } else {
-                bot.sendMessage(chatId, "🔒 Private Bot.").catch(e => {});
+                bot.sendMessage(chatId, "🔒 Private Bot\\.").catch(e => {});
             }
         }
 
         if (USER_STATE[userId]) {
             if (USER_STATE[userId].step === "ask_name") {
-                // 🔥 FIX: Strict Name Sanitization (Replace spaces with _, remove weird chars)
                 const projName = text.trim().replace(/\s+/g, '_').replace(/[^\w-]/g, '');
                 
                 const exists = await projectsCol.findOne({ user_id: userId, name: projName });
@@ -298,12 +304,12 @@ bot.on('message', async (msg) => {
 
                 USER_STATE[userId] = { step: "wait_files", name: projName };
                 const opts = { reply_markup: { resize_keyboard: true, keyboard: [[{ text: "✅ Done / Start Deploy" }]] }, parse_mode: 'MarkdownV2' };
-                bot.sendMessage(chatId, `✅ Name: *${escapeMarkdown(projName)}*\n\nSend files now.`, opts).catch(e => {});
+                bot.sendMessage(chatId, `✅ Name: *${escapeMarkdown(projName)}*\n\nSend files now\\.`, opts).catch(e => {});
             }
             else if (text === "✅ Done / Start Deploy" && USER_STATE[userId].step === "wait_files") {
                 const projName = USER_STATE[userId].name;
                 delete USER_STATE[userId];
-                bot.sendMessage(chatId, "⚙️ Processing...", { reply_markup: { remove_keyboard: true } }).catch(e => {});
+                bot.sendMessage(chatId, "⚙️ Processing\\.\\.\\.", { reply_markup: { remove_keyboard: true }, parse_mode: 'MarkdownV2' }).catch(e => {});
                 startProject(userId, projName, chatId);
             }
         }
@@ -329,7 +335,7 @@ bot.on('document', async (msg) => {
             await projectsCol.updateOne({ user_id: userId, name: projName }, { $push: { files: { name: fileName, content: Buffer.from(buffer) } } }, { upsert: true });
 
             if (USER_STATE[userId].step === "update_files") {
-                bot.sendMessage(msg.chat.id, `🔄 *Updated:* \`${escapeMarkdown(fileName)}\`\n\n🛑 Restarting...`, { parse_mode: 'MarkdownV2' }).catch(e => {});
+                bot.sendMessage(msg.chat.id, `🔄 *Updated:* \`${escapeMarkdown(fileName)}\`\n\n🛑 Restarting\\.\\.\\.`, { parse_mode: 'MarkdownV2' }).catch(e => {});
                 await forceStopProject(userId, projName);
                 startProject(userId, projName, msg.chat.id);
                 delete USER_STATE[userId];
@@ -357,8 +363,6 @@ bot.on('callback_query', async (query) => {
         }
         else if (data === "manage_projects") {
             const projects = await projectsCol.find({ user_id: userId }).toArray();
-            // Using MarkdownV2 escaping for names in buttons is tricky, plain text is safer for buttons usually, 
-            // but we need escaping for the header message.
             const keyboard = projects.map(p => [{ 
                 text: `${p.status === "Running" ? "🟢" : "🔴"} ${p.name}`, 
                 callback_data: `menu_${p.name}` 
@@ -368,7 +372,6 @@ bot.on('callback_query', async (query) => {
         }
         
         else if (data.startsWith("menu_")) {
-            // 🔥 FIX: Use substring/replace instead of split to handle underscores in name
             const projName = getProjNameFromData(data, "menu_");
             const projectId = `${userId}_${projName}`;
             
@@ -393,7 +396,7 @@ bot.on('callback_query', async (query) => {
             
             if (ACTIVE_SESSIONS[projectId]) {
                 await forceStopProject(userId, projName);
-                bot.sendMessage(chatId, `🛑 *${escapeMarkdown(projName)} Stopped.*`, { parse_mode: 'MarkdownV2' }).catch(e => {});
+                bot.sendMessage(chatId, `🛑 *${escapeMarkdown(projName)} Stopped\\.*`, { parse_mode: 'MarkdownV2' }).catch(e => {});
             } else {
                 try { await bot.deleteMessage(chatId, messageId); } catch(e){}
                 startProject(userId, projName, chatId);
@@ -435,7 +438,7 @@ bot.on('callback_query', async (query) => {
             const projName = getProjNameFromData(data, "upd_");
             USER_STATE[userId] = { step: "update_files", name: projName };
             const escapedName = escapeMarkdown(projName);
-            await safeEditMessage(chatId, messageId, `📝 *Update Mode: ${escapedName}*\n\nSend new files.`, [[{ text: "🔙 Cancel", callback_data: "manage_projects" }]]);
+            await safeEditMessage(chatId, messageId, `📝 *Update Mode: ${escapedName}*\n\nSend new files\\.`, [[{ text: "🔙 Cancel", callback_data: "manage_projects" }]]);
         }
 
         else if (data === "main_menu") {
