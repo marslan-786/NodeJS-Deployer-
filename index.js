@@ -3,7 +3,7 @@ const { MongoClient } = require('mongodb');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const uuid = require('uuid'); // UUID for keys
+const uuid = require('uuid');
 
 // ================= CONFIGURATION =================
 const TOKEN = "8452280797:AAEruS20yx0YCb2T8aHIZk8xjzRlLb6GDAk"; 
@@ -28,6 +28,7 @@ const USER_STATE = {};
 const SESSION_WATCHERS = {}; 
 const LOG_DIR = path.join(__dirname, 'temp_logs');
 
+// Clean up logs on start
 if (fs.existsSync(LOG_DIR)) fs.rmSync(LOG_DIR, { recursive: true, force: true });
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
@@ -51,8 +52,10 @@ connectDB();
 
 function escapeMarkdown(text) {
     if (!text) return "";
-    return text.toString().replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+    // میں نے ` کی جگہ \x60 لکھ دیا ہے تاکہ آپ کا ایڈیٹر کنفیوز نہ ہو
+    return text.toString().replace(/[_*[\]()~\x60>#+\-=|{}.!]/g, '\\$&');
 }
+
 
 async function isAuthorized(userId) {
     if (OWNER_IDS.includes(userId)) return true;
@@ -97,31 +100,41 @@ async function safeEditMessage(chatId, messageId, text, keyboard) {
     }
 }
 
+// Move File Helper (Async to prevent hanging)
 async function moveFile(userId, projName, basePath, fileName, targetFolder, chatId) {
     const oldPath = path.join(basePath, fileName);
     const newDir = path.join(basePath, targetFolder);
     const newPath = path.join(newDir, fileName);
 
-    if (fs.existsSync(oldPath)) {
-        if (!fs.existsSync(newDir)) fs.mkdirSync(newDir, { recursive: true });
+    try {
+        if (!fs.existsSync(oldPath)) {
+             await bot.sendMessage(chatId, `⚠️ File not found: \`${fileName}\`\nUpload it first!`, { parse_mode: 'Markdown' });
+             return;
+        }
+
+        if (!fs.existsSync(newDir)) {
+            await fs.promises.mkdir(newDir, { recursive: true });
+        }
         
-        fs.renameSync(oldPath, newPath);
+        await fs.promises.rename(oldPath, newPath);
         
-        // DB Update
-        const fileContent = fs.readFileSync(newPath);
+        // Update DB
+        const fileContent = await fs.promises.readFile(newPath); 
         await projectsCol.updateOne(
             { user_id: userId, name: projName }, 
             { $pull: { files: { name: fileName } } }
         );
-        const relativePath = path.join(targetFolder, fileName).replace(/\\/g, '/');
+        
+        const relativePath = path.join(targetFolder, fileName).replace(/\\/g, '/'); 
         await projectsCol.updateOne(
             { user_id: userId, name: projName }, 
             { $push: { files: { name: relativePath, content: fileContent } } }
         );
 
-        bot.sendMessage(chatId, `📂 Moved \`${fileName}\` ➡️ \`${targetFolder}\``, { parse_mode: 'Markdown' }).catch(e=>{});
-    } else {
-        bot.sendMessage(chatId, `❌ File \`${fileName}\` not found in root. Upload it first.`, { parse_mode: 'Markdown' }).catch(e=>{});
+        await bot.sendMessage(chatId, `📂 Moved: \`${fileName}\` ➡️ \`${targetFolder}\``, { parse_mode: 'Markdown' });
+    } catch (error) {
+        console.error("Move Error:", error);
+        await bot.sendMessage(chatId, `❌ Error moving \`${fileName}\``, { parse_mode: 'Markdown' });
     }
 }
 
@@ -281,7 +294,7 @@ async function startProject(userId, projName, chatId, silent = false) {
     });
 }
 
-// ================= MESSAGE HANDLERS =================
+// ================= MESSAGE HANDLERS (UPDATED) =================
 
 bot.on('message', async (msg) => {
     try {
@@ -289,33 +302,42 @@ bot.on('message', async (msg) => {
         const userId = msg.from.id;
         const text = msg.text;
 
-        let targetProjId = null;
-        for (const [pid, session] of Object.entries(ACTIVE_SESSIONS)) {
-            if (session.chatId === chatId && session.logging) {
-                targetProjId = pid;
-                break;
-            }
-        }
-        if (targetProjId && text && !text.startsWith("/")) {
-            const session = ACTIVE_SESSIONS[targetProjId];
-            if (session.process && !session.process.killed) {
-                try { session.process.stdin.write(text + "\n"); } catch (e) {}
-                return;
-            }
-        }
-
-        if (!text) return;
-
-        if (text.startsWith("/start")) {
+        // --- COMMANDS ---
+        if (text && text.startsWith("/start")) {
             if (await isAuthorized(userId)) {
                 bot.sendMessage(chatId, "👋 *Node\\.js Master Bot*", { reply_markup: getMainMenu(userId), parse_mode: 'MarkdownV2' }).catch(e => {});
             } else {
                 bot.sendMessage(chatId, "🔒 Private Bot\\.").catch(e => {});
             }
+            return;
         }
 
+        // --- STATE HANDLING ---
         if (USER_STATE[userId]) {
-            // STEP: ASK NAME
+            
+            // PRIORITY: Check for "DONE" Button
+            if (text === "✅ Done / Apply Actions") {
+                if (USER_STATE[userId].step === "wait_files" || USER_STATE[userId].step === "update_files") {
+                    const projName = USER_STATE[userId].name;
+                    const isUpdate = USER_STATE[userId].step === "update_files";
+                    
+                    delete USER_STATE[userId]; 
+                    
+                    const statusMsg = await bot.sendMessage(chatId, "⚙️ *Processing Actions\\.\\.\\.*", { reply_markup: { remove_keyboard: true }, parse_mode: 'MarkdownV2' });
+
+                    if (isUpdate) {
+                        await forceStopProject(userId, projName);
+                    }
+                    
+                    setTimeout(() => {
+                        startProject(userId, projName, chatId);
+                        bot.deleteMessage(chatId, statusMsg.message_id).catch(e=>{});
+                    }, 1500);
+                    return;
+                }
+            }
+
+            // Step 1: Ask Name (New Deploy)
             if (USER_STATE[userId].step === "ask_name") {
                 const projName = text.trim().replace(/\s+/g, '_').replace(/[^\w-]/g, '');
                 const exists = await projectsCol.findOne({ user_id: userId, name: projName });
@@ -323,41 +345,49 @@ bot.on('message', async (msg) => {
 
                 USER_STATE[userId] = { step: "wait_files", name: projName };
                 const opts = { reply_markup: { resize_keyboard: true, keyboard: [[{ text: "✅ Done / Apply Actions" }]] }, parse_mode: 'MarkdownV2' };
-                bot.sendMessage(chatId, `✅ Name: *${escapeMarkdown(projName)}*\n\n1️⃣ Send files now\\.\n2️⃣ Move files: \`folder/file.js\`\n3️⃣ Click Done when finished\\.`, opts).catch(e => {});
+                bot.sendMessage(chatId, `✅ Name: *${escapeMarkdown(projName)}*\n\n1️⃣ Send files now\\.\n2️⃣ To move: \`folder/file.js\`\n3️⃣ Click Done when finished\\.`, opts).catch(e => {});
             }
-            // STEP: DONE BUTTON
-            else if (text === "✅ Done / Apply Actions") {
-                if (USER_STATE[userId].step === "wait_files" || USER_STATE[userId].step === "update_files") {
-                    const projName = USER_STATE[userId].name;
-                    const isUpdate = USER_STATE[userId].step === "update_files";
-                    
-                    delete USER_STATE[userId];
-                    bot.sendMessage(chatId, "⚙️ Processing\\.\\.\\.", { reply_markup: { remove_keyboard: true }, parse_mode: 'MarkdownV2' }).catch(e => {});
-                    
-                    if (isUpdate) await forceStopProject(userId, projName);
-                    startProject(userId, projName, chatId);
-                }
-            }
-            // STEP: FOLDER MANAGEMENT (TEXT COMMANDS)
+
+            // Step 2: Handle Folder Commands
             else if (USER_STATE[userId].step === "wait_files" || USER_STATE[userId].step === "update_files") {
+                if (!text) return;
                 const projName = USER_STATE[userId].name;
                 const basePath = path.join(__dirname, 'deployments', userId.toString(), projName);
 
-                // Pattern 1: "plugins/tools.js" (Direct Path)
+                // Case A: path/file.js
                 if (text.includes('/')) {
                     const parts = text.split('/');
                     const fileName = parts.pop();
                     const folderPath = parts.join('/');
-                    moveFile(userId, projName, basePath, fileName, folderPath, chatId);
+                    await moveFile(userId, projName, basePath, fileName, folderPath, chatId);
                 } 
-                // Pattern 2: "folder file1.js file2.js" (Space Separated)
+                // Case B: folder file1 file2
                 else if (text.includes(' ')) {
                     const args = text.split(/\s+/);
                     const folderName = args[0];
                     const filesToMove = args.slice(1);
-                    filesToMove.forEach(f => moveFile(userId, projName, basePath, f, folderName, chatId));
+                    for (const f of filesToMove) {
+                        await moveFile(userId, projName, basePath, f, folderName, chatId);
+                    }
                 }
             }
+        } 
+        
+        // --- LIVE CONSOLE INPUT ---
+        else {
+             let targetProjId = null;
+             for (const [pid, session] of Object.entries(ACTIVE_SESSIONS)) {
+                 if (session.chatId === chatId && session.logging) {
+                     targetProjId = pid;
+                     break;
+                 }
+             }
+             if (targetProjId && text && !text.startsWith("/")) {
+                 const session = ACTIVE_SESSIONS[targetProjId];
+                 if (session.process && !session.process.killed) {
+                     try { session.process.stdin.write(text + "\n"); } catch (e) {}
+                 }
+             }
         }
     } catch (err) { console.error("Msg Error:", err); }
 });
@@ -375,12 +405,14 @@ bot.on('document', async (msg) => {
             const fileLink = await bot.getFileLink(msg.document.file_id);
             const response = await fetch(fileLink);
             const buffer = await response.arrayBuffer();
+            
+            // Write to Root initially
             fs.writeFileSync(filePath, Buffer.from(buffer));
 
             await projectsCol.updateOne({ user_id: userId, name: projName }, { $pull: { files: { name: fileName } } });
             await projectsCol.updateOne({ user_id: userId, name: projName }, { $push: { files: { name: fileName, content: Buffer.from(buffer) } } }, { upsert: true });
 
-            // Removed Immediate Restart logic. Now just confirms receipt.
+            // Just confirm, do NOT restart
             bot.sendMessage(msg.chat.id, `📥 Received: \`${escapeMarkdown(fileName)}\``, { parse_mode: 'MarkdownV2' }).catch(e => {});
         }
     } catch (err) { console.error("Doc Error:", err); }
@@ -451,7 +483,6 @@ bot.on('callback_query', async (query) => {
             if (keyDoc) {
                 const newStatus = keyDoc.status === 'active' ? 'inactive' : 'active';
                 await keysCol.updateOne({ key: keyStr }, { $set: { status: newStatus } });
-                // Refresh view
                 bot.emit('callback_query', { ...query, data: `view_key_${keyStr}` });
             }
         }
@@ -459,7 +490,6 @@ bot.on('callback_query', async (query) => {
         else if (data.startsWith("del_key_")) {
             const keyStr = data.replace("del_key_", "");
             await keysCol.deleteOne({ key: keyStr });
-            // Go back to list
             bot.emit('callback_query', { ...query, data: "list_keys" });
         }
         // --- OWNER PANEL END ---
@@ -551,8 +581,7 @@ bot.on('callback_query', async (query) => {
                     keyboard: [[{ text: "✅ Done / Apply Actions" }]] 
                 }
             };
-            
-            await bot.sendMessage(chatId, `📝 *Update Mode: ${escapedName}*\n\n1️⃣ Send new files\\.\n2️⃣ Move: \`plugins/file.js\`\n3️⃣ Click Done to restart\\.`, opts);
+            await bot.sendMessage(chatId, `📝 *Update Mode: ${escapedName}*\n\n1️⃣ Send new files\\.\n2️⃣ To move: \`folder/file.js\`\n3️⃣ Click Done to restart\\.`, opts);
         }
 
         else if (data === "main_menu") {
