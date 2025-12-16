@@ -28,6 +28,17 @@ const USER_STATE = {};
 const SESSION_WATCHERS = {}; 
 const LOG_DIR = path.join(__dirname, 'temp_logs');
 
+// Keywords that trigger auto-session deletion
+const BAD_SESSION_KEYWORDS = [
+    "Connection Closed", 
+    "Logged out", 
+    "Stream Errored", 
+    "Unauthorized", 
+    "Bad MAC", 
+    "401", 
+    "Connection Lost"
+];
+
 // Clean up logs on start
 if (fs.existsSync(LOG_DIR)) fs.rmSync(LOG_DIR, { recursive: true, force: true });
 fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -52,10 +63,8 @@ connectDB();
 
 function escapeMarkdown(text) {
     if (!text) return "";
-    // میں نے ` کی جگہ \x60 لکھ دیا ہے تاکہ آپ کا ایڈیٹر کنفیوز نہ ہو
     return text.toString().replace(/[_*[\]()~\x60>#+\-=|{}.!]/g, '\\$&');
 }
-
 
 async function isAuthorized(userId) {
     if (OWNER_IDS.includes(userId)) return true;
@@ -100,7 +109,7 @@ async function safeEditMessage(chatId, messageId, text, keyboard) {
     }
 }
 
-// Move File Helper (Async to prevent hanging)
+// Move File Helper
 async function moveFile(userId, projName, basePath, fileName, targetFolder, chatId) {
     const oldPath = path.join(basePath, fileName);
     const newDir = path.join(basePath, targetFolder);
@@ -208,6 +217,33 @@ async function forceStopProject(userId, projName) {
     await projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Stopped" } });
 }
 
+// === NEW: HARD RESET SESSION FUNCTION ===
+async function hardResetSession(userId, projName, chatId, basePath) {
+    try {
+        await forceStopProject(userId, projName);
+        
+        // 1. Delete local session folder
+        const sessionPath = path.join(basePath, 'session');
+        if (fs.existsSync(sessionPath)) {
+            fs.rmSync(sessionPath, { recursive: true, force: true });
+        }
+        
+        // 2. Clear MongoDB session
+        await projectsCol.updateOne(
+            { user_id: userId, name: projName }, 
+            { $unset: { session_data: "" } }
+        );
+
+        if(chatId) bot.sendMessage(chatId, `♻️ *Session Expired/Reset.*\nStarting fresh...`, { parse_mode: 'Markdown' }).catch(e => {});
+        
+        // 3. Restart
+        setTimeout(() => startProject(userId, projName, chatId), 2000);
+        
+    } catch (e) {
+        console.error("Hard Reset Error:", e);
+    }
+}
+
 async function startProject(userId, projName, chatId, silent = false) {
     const basePath = path.join(__dirname, 'deployments', userId.toString(), projName);
     const projectId = `${userId}_${projName}`;
@@ -239,7 +275,8 @@ async function startProject(userId, projName, chatId, silent = false) {
         process: child,
         logging: true,
         logStream: logStream,
-        chatId: chatId
+        chatId: chatId,
+        basePath: basePath // Storing path for resets
     };
 
     setupSessionSync(userId, projName, basePath);
@@ -249,6 +286,14 @@ async function startProject(userId, projName, chatId, silent = false) {
     child.stdout.on('data', (data) => {
         const rawOutput = data.toString();
         logStream.write(rawOutput);
+
+        // Check for session corruption triggers
+        if (BAD_SESSION_KEYWORDS.some(k => rawOutput.includes(k))) {
+            if (ACTIVE_SESSIONS[projectId]) {
+                hardResetSession(userId, projName, chatId, basePath);
+            }
+            return;
+        }
 
         if (!ACTIVE_SESSIONS[projectId] || !ACTIVE_SESSIONS[projectId].logging || !chatId) return;
 
@@ -262,7 +307,9 @@ async function startProject(userId, projName, chatId, silent = false) {
 
         if (cleanOutput.includes("Opened connection") || cleanOutput.includes("Connected Successfully")) {
             bot.sendMessage(chatId, `✅ *Success\\! Bot is Online\\.*\n\n🔇 _Live Logging Disabled\\._`, { parse_mode: "MarkdownV2" }).catch(e => {});
-            if (ACTIVE_SESSIONS[projectId]) ACTIVE_SESSIONS[projectId].logging = false;
+            // Keep logging TRUE for a bit or just rely on user manual toggle. 
+            // Disabled auto-off so input works if user needs to interact later.
+            // if (ACTIVE_SESSIONS[projectId]) ACTIVE_SESSIONS[projectId].logging = false;
             return;
         }
 
@@ -276,6 +323,15 @@ async function startProject(userId, projName, chatId, silent = false) {
     child.stderr.on('data', (data) => {
         logStream.write(data);
         const error = data.toString();
+        
+        // Also check stderr for session errors
+        if (BAD_SESSION_KEYWORDS.some(k => error.includes(k))) {
+            if (ACTIVE_SESSIONS[projectId]) {
+                hardResetSession(userId, projName, chatId, basePath);
+            }
+            return;
+        }
+
         if (ACTIVE_SESSIONS[projectId] && ACTIVE_SESSIONS[projectId].logging && chatId && !error.includes("npm")) {
              bot.sendMessage(chatId, `⚠️ *Error:*\n\`${escapeMarkdown(error.slice(0, 200))}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
         }
@@ -373,7 +429,7 @@ bot.on('message', async (msg) => {
             }
         } 
         
-        // --- LIVE CONSOLE INPUT ---
+        // --- LIVE CONSOLE INPUT FIX ---
         else {
              let targetProjId = null;
              for (const [pid, session] of Object.entries(ACTIVE_SESSIONS)) {
@@ -385,7 +441,14 @@ bot.on('message', async (msg) => {
              if (targetProjId && text && !text.startsWith("/")) {
                  const session = ACTIVE_SESSIONS[targetProjId];
                  if (session.process && !session.process.killed) {
-                     try { session.process.stdin.write(text + "\n"); } catch (e) {}
+                     try { 
+                         // FIX: Send input with newline explicitly
+                         session.process.stdin.write(text + "\n");
+                         // FIX: Visual Confirmation
+                         bot.sendMessage(chatId, `⌨️ _Sent to Terminal:_ \`${text}\``, { parse_mode: 'Markdown' }).catch(()=>{});
+                     } catch (e) {
+                         bot.sendMessage(chatId, `❌ Write Error: ${e.message}`);
+                     }
                  }
              }
         }
@@ -519,6 +582,7 @@ bot.on('callback_query', async (query) => {
                 [{ text: isRunning ? "🛑 Stop" : "▶️ Start", callback_data: `toggle_run_${projName}` }, 
                  { text: isLogging ? "🔴 Disable Logs" : "🟢 Enable Logs", callback_data: `toggle_log_${projName}` }],
                 [{ text: "📝 Update Files", callback_data: `upd_${projName}` }, { text: "📥 Download Logs", callback_data: `get_logs_${projName}` }],
+                [{ text: "🔥 Hard Reset / Wipe Session", callback_data: `wipeses_${projName}` }],
                 [{ text: "🗑️ Delete", callback_data: `del_${projName}` }],
                 [{ text: "🔙 Back", callback_data: "manage_projects" }]
             ];
@@ -540,6 +604,13 @@ bot.on('callback_query', async (query) => {
                 return; 
             }
             bot.emit('callback_query', { ...query, data: `menu_${projName}` });
+        }
+
+        // === Manual Wipe Session ===
+        else if (data.startsWith("wipeses_")) {
+            const projName = getProjNameFromData(data, "wipeses_");
+            const basePath = path.join(__dirname, 'deployments', userId.toString(), projName);
+            await hardResetSession(userId, projName, chatId, basePath);
         }
 
         else if (data.startsWith("toggle_log_")) {
