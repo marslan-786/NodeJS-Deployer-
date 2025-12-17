@@ -25,7 +25,7 @@ let db, projectsCol, keysCol, usersCol;
 // Global Variables
 const ACTIVE_SESSIONS = {}; 
 const USER_STATE = {}; 
-const FILE_WATCHERS = {}; // To track file sync watchers
+const FILE_WATCHERS = {}; 
 const LOG_DIR = path.join(__dirname, 'temp_logs');
 
 // Clean up logs on start
@@ -40,8 +40,6 @@ async function connectDB() {
         keysCol = db.collection("access_keys");
         usersCol = db.collection("users");
         console.log("✅ Connected to MongoDB");
-        
-        // 🔄 ON STARTUP: RESTORE EVERYTHING FROM DB
         setTimeout(restoreProjects, 3000); 
     } catch (e) {
         console.error("❌ DB Error:", e);
@@ -76,8 +74,9 @@ function getMainMenu(userId) {
     return { inline_keyboard: keyboard };
 }
 
+// Fixed: Simple replace, allow spaces logic to work
 function getProjNameFromData(data, prefix) {
-    return data.replace(prefix, ""); 
+    return data.substring(prefix.length); 
 }
 
 async function safeEditMessage(chatId, messageId, text, keyboard) {
@@ -98,11 +97,8 @@ async function safeEditMessage(chatId, messageId, text, keyboard) {
     }
 }
 
-// Save File to Disk AND MongoDB
 async function saveFileToStorage(userId, projName, relativePath, contentBuffer) {
     try {
-        // 1. Update DB (Upsert: Replace if exists, Add if new)
-        // We pull first to avoid duplicates, then push.
         await projectsCol.updateOne(
             { user_id: userId, name: projName },
             { $pull: { files: { name: relativePath } } }
@@ -111,12 +107,9 @@ async function saveFileToStorage(userId, projName, relativePath, contentBuffer) 
             { user_id: userId, name: projName },
             { $push: { files: { name: relativePath, content: contentBuffer } } }
         );
-    } catch (e) {
-        console.error(`DB Save Error (${relativePath}):`, e.message);
-    }
+    } catch (e) { console.error(`DB Save Error:`, e.message); }
 }
 
-// Move File Helper
 async function moveFile(userId, projName, basePath, fileName, targetFolder, chatId) {
     const oldPath = path.join(basePath, fileName);
     const newDir = path.join(basePath, targetFolder);
@@ -127,20 +120,14 @@ async function moveFile(userId, projName, basePath, fileName, targetFolder, chat
              await bot.sendMessage(chatId, `⚠️ File not found: \`${fileName}\`\nUpload it first!`, { parse_mode: 'Markdown' });
              return;
         }
-
-        if (!fs.existsSync(newDir)) {
-            await fs.promises.mkdir(newDir, { recursive: true });
-        }
+        if (!fs.existsSync(newDir)) await fs.promises.mkdir(newDir, { recursive: true });
         
         await fs.promises.rename(oldPath, newPath);
         
-        // Read the moved file to update DB
         const fileContent = await fs.promises.readFile(newPath); 
-        const relativePath = path.join(targetFolder, fileName).replace(/\\/g, '/'); // Ensure forward slashes
+        const relativePath = path.join(targetFolder, fileName).replace(/\\/g, '/'); 
         
-        // Update DB
         await saveFileToStorage(userId, projName, relativePath, fileContent);
-        // Remove old path from DB
         await projectsCol.updateOne(
             { user_id: userId, name: projName }, 
             { $pull: { files: { name: fileName } } }
@@ -166,38 +153,21 @@ function installDependencies(basePath, chatId) {
     });
 }
 
-// 🔥 FULL SYNC WATCHER: Watches EVERYTHING (Sessions, DBs, Files) 🔥
 function startFullSyncWatcher(userId, projName, basePath) {
     const watcherId = `${userId}_${projName}`;
-    
-    // Clear existing watcher if any
-    if (FILE_WATCHERS[watcherId]) {
-        try { FILE_WATCHERS[watcherId].close(); } catch(e){}
-    }
+    if (FILE_WATCHERS[watcherId]) try { FILE_WATCHERS[watcherId].close(); } catch(e){}
 
     try {
-        // Recursive watch on the whole project folder
         const watcher = fs.watch(basePath, { recursive: true }, async (eventType, filename) => {
             if (filename) {
-                // ⛔ IGNORE node_modules and temp files (Too big/frequent)
                 if (filename.includes('node_modules') || filename.includes('.git') || filename.includes('package-lock.json')) return;
-                
                 const fullPath = path.join(basePath, filename);
-                
-                // Only sync if file exists (it was created or modified)
-                // If deleted, we keep it in DB for safety, or handle deletion logic separately.
-                // For now, we sync updates.
                 if (fs.existsSync(fullPath)) {
-                    // Check if it's a file (not a folder)
                     try {
                         const stats = fs.statSync(fullPath);
                         if (stats.isFile()) {
                             const content = fs.readFileSync(fullPath);
-                            const relativePath = filename.replace(/\\/g, '/'); // Normalize path
-                            
-                            // SYNC TO MONGODB
-                            // We use a simplified update without pulling first to reduce DB operations for rapid changes?
-                            // No, pull/push is safer for array structure to avoid duplicates.
+                            const relativePath = filename.replace(/\\/g, '/');
                             await projectsCol.updateOne(
                                 { user_id: userId, name: projName },
                                 { $pull: { files: { name: relativePath } } }
@@ -206,19 +176,13 @@ function startFullSyncWatcher(userId, projName, basePath) {
                                 { user_id: userId, name: projName },
                                 { $push: { files: { name: relativePath, content: content } } }
                             );
-                            // console.log(`🔄 Synced: ${relativePath}`);
                         }
-                    } catch (err) {
-                        // File might be locked or deleted rapidly
-                    }
+                    } catch (err) {}
                 }
             }
         });
         FILE_WATCHERS[watcherId] = watcher;
-        console.log(`👀 Watching ${projName} for changes...`);
-    } catch (err) {
-        console.error("Watcher Error:", err.message);
-    }
+    } catch (err) {}
 }
 
 async function forceStopProject(userId, projName) {
@@ -239,22 +203,15 @@ async function renewSession(userId, projName, chatId, basePath) {
     try {
         await forceStopProject(userId, projName);
         
-        // 1. Delete session-related files from DB
-        // We assume session files are usually in a folder or have specific names. 
-        // A safer way is to delete the 'session' folder locally and let the watcher update DB?
-        // No, watcher update is triggered on file change. Deletion might not be synced if logic is "exists".
-        
-        // Manual Clean from DB for typical Baileys folders
         await projectsCol.updateOne(
             { user_id: userId, name: projName },
-            { $pull: { files: { name: { $regex: /^session\// } } } } // Remove all files starting with session/
+            { $pull: { files: { name: { $regex: /^session\// } } } }
         );
         await projectsCol.updateOne(
             { user_id: userId, name: projName },
             { $pull: { files: { name: { $regex: /^auth_info_baileys\// } } } } 
         );
 
-        // 2. Delete Local Folder
         const sessionPath = path.join(basePath, 'session');
         const authPath = path.join(basePath, 'auth_info_baileys');
         if (fs.existsSync(sessionPath)) fs.rmSync(sessionPath, { recursive: true, force: true });
@@ -262,9 +219,7 @@ async function renewSession(userId, projName, chatId, basePath) {
 
         if(chatId) bot.sendMessage(chatId, `🔄 *Session Renewed/Cleared.*\nStarting fresh...`, { parse_mode: 'Markdown' }).catch(e => {});
         setTimeout(() => startProject(userId, projName, chatId), 2000);
-    } catch (e) {
-        console.error("Renew Error:", e);
-    }
+    } catch (e) {}
 }
 
 // ================= 🔥 MAIN START PROJECT 🔥 =================
@@ -278,11 +233,8 @@ async function startProject(userId, projName, chatId, silent = false) {
 
     if (!silent && chatId) bot.sendMessage(chatId, `⏳ *Initializing ${safeName}\\.\\.\\.*`, { parse_mode: 'MarkdownV2' }).catch(e => {});
 
-    // Ensure directory exists (in case it's a fresh start)
     if (!fs.existsSync(basePath)) fs.mkdirSync(basePath, { recursive: true });
 
-    // 🔄 RESTORE FILES FROM DB BEFORE START
-    // This is crucial for Railway Restarts
     const projectData = await projectsCol.findOne({ user_id: userId, name: projName });
     if (projectData && projectData.files) {
         for (const file of projectData.files) {
@@ -291,10 +243,8 @@ async function startProject(userId, projName, chatId, silent = false) {
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
             fs.writeFileSync(fullPath, file.content.buffer);
         }
-        // console.log(`✅ Restored ${projectData.files.length} files for ${projName}`);
     }
 
-    // Install deps if needed
     if (fs.existsSync(path.join(basePath, 'package.json'))) {
         try {
             if (!silent || !fs.existsSync(path.join(basePath, 'node_modules'))) {
@@ -309,60 +259,64 @@ async function startProject(userId, projName, chatId, silent = false) {
 
     ACTIVE_SESSIONS[projectId] = {
         process: child,
-        logging: true, // Start ON
+        logging: true,
         logStream: logStream,
         chatId: chatId,
         basePath: basePath
     };
 
-    // 🔥 START THE WATCHER 🔥
     startFullSyncWatcher(userId, projName, basePath);
-
     await projectsCol.updateOne({ user_id: userId, name: projName }, { $set: { status: "Running", path: basePath } });
 
     if (!silent && chatId) {
         bot.sendMessage(chatId, `🚀 *App Started\\.*\nWaiting for Login Code/Success\\.\\.\\.`, { parse_mode: 'MarkdownV2' }).catch(e => {});
     }
 
-    // --- STDOUT HANDLER ---
+    // --- SMART LOGIC: STDOUT HANDLER ---
     child.stdout.on('data', (data) => {
         const rawOutput = data.toString();
-        logStream.write(rawOutput);
+        logStream.write(rawOutput); // Always save to file
 
         if (!chatId) return;
 
         const cleanOutput = rawOutput.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
         const lowerOut = cleanOutput.toLowerCase();
 
-        // 1. PAIRING CODE
-        const codeMatch = cleanOutput.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/);
+        // 🚨 PRIORITY 1: PAIRING CODE (Never Mute)
+        // Matches typical codes: ABCD-1234 or longer alphanumeric
+        const codeMatch = cleanOutput.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/) || cleanOutput.match(/Pairing Code:\s*([A-Z0-9-]{8,})/i);
         if (codeMatch) {
-            bot.sendMessage(chatId, `🔑 *YOUR PAIRING CODE:*\n\n\`${codeMatch[0]}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
-            return; 
+            let code = codeMatch[1] || codeMatch[0];
+            bot.sendMessage(chatId, `🔑 *YOUR PAIRING CODE:*\n\n\`${code}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
+            return; // Exit to avoid processing as success
         }
 
-        // 2. INPUT REQUESTS
-        if ((lowerOut.includes("enter") || lowerOut.includes("input") || lowerOut.includes("provide") || lowerOut.includes("number")) && cleanOutput.includes(":")) {
+        // 🚨 PRIORITY 2: INPUT REQUEST (Never Mute)
+        // Checks for "Enter number", "Input code", etc.
+        if ((lowerOut.includes("enter") || lowerOut.includes("input") || lowerOut.includes("provide") || lowerOut.includes("number?")) && cleanOutput.includes(":")) {
              bot.sendMessage(chatId, `⌨️ *Input Requested:*\n\`${escapeMarkdown(cleanOutput.trim())}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
              return;
         }
 
-        // 3. AUTO-MUTE ON SUCCESS
+        // 🚨 PRIORITY 3: SUCCESS AUTO-MUTE (Strict)
+        // Removed generic "✅" to avoid false positives with pairing codes
         const successKeywords = [
-            "success", "connected", "bot is live", "open", "authenticated", 
-            "✅", "started!", "database connected", "sa message", "bot connected"
+            "connection open", "bot connected", "authenticated", 
+            "bot is live", "open: true", "success: true", "connected to whatsapp"
         ];
 
-        if (successKeywords.some(k => lowerOut.includes(k))) {
+        // Check if it's a real success message AND not a pairing code message
+        if (successKeywords.some(k => lowerOut.includes(k)) && !lowerOut.includes("pairing")) {
             bot.sendMessage(chatId, `✅ *Status Update:*\n\`${escapeMarkdown(cleanOutput.trim())}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
+            
             if (ACTIVE_SESSIONS[projectId].logging) {
                 ACTIVE_SESSIONS[projectId].logging = false;
-                bot.sendMessage(chatId, `🔇 *Auto-Mute Active:* Bot is Live! Logs disabled to keep chat clean.`).catch(()=>{});
+                bot.sendMessage(chatId, `🔇 *Auto-Mute Active:* Bot is connected! Logs disabled.`).catch(()=>{});
             }
             return;
         }
 
-        // 4. Normal Logs
+        // 4. Normal Logs (Only if logging is ON)
         if (ACTIVE_SESSIONS[projectId].logging) {
              if(cleanOutput.trim().length > 0 && cleanOutput.length < 800) {
                  bot.sendMessage(chatId, `🖥️ \`${escapeMarkdown(cleanOutput.trim())}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
@@ -430,7 +384,13 @@ bot.on('message', async (msg) => {
             }
 
             if (USER_STATE[userId].step === "ask_name") {
-                const projName = text.trim().replace(/\s+/g, '_').replace(/[^\w-]/g, '');
+                // FIXED: Removed .replace(/\s+/g, '_') to allow spaces
+                const projName = text.trim(); 
+                // Only basic sanitation for dangerous chars (directory traversal)
+                if (projName.includes('..') || projName.includes('/') || projName.includes('\\')) {
+                     return bot.sendMessage(chatId, "❌ Invalid name.").catch(e => {});
+                }
+
                 const exists = await projectsCol.findOne({ user_id: userId, name: projName });
                 if (exists) return bot.sendMessage(chatId, "❌ Name taken.").catch(e => {});
                 USER_STATE[userId] = { step: "wait_files", name: projName };
@@ -489,10 +449,7 @@ bot.on('document', async (msg) => {
             const response = await fetch(fileLink);
             const buffer = await response.arrayBuffer();
             
-            // Save to Disk
             fs.writeFileSync(filePath, Buffer.from(buffer));
-            
-            // Save to DB Immediately
             await saveFileToStorage(userId, projName, fileName, Buffer.from(buffer));
 
             bot.sendMessage(msg.chat.id, `📥 Received: \`${escapeMarkdown(fileName)}\``, { parse_mode: 'MarkdownV2' }).catch(e => {});
@@ -571,7 +528,7 @@ bot.on('callback_query', async (query) => {
         
         else if (data === "deploy_new") {
             USER_STATE[userId] = { step: "ask_name" };
-            bot.sendMessage(chatId, "📂 Enter Project Name (No spaces):").catch(e => {});
+            bot.sendMessage(chatId, "📂 Enter Project Name (Spaces allowed):").catch(e => {});
         }
         else if (data === "manage_projects") {
             const projects = await projectsCol.find({ user_id: userId }).toArray();
@@ -657,22 +614,14 @@ bot.on('callback_query', async (query) => {
     } catch (err) { }
 });
 
-// 🔥 ON RESTART: RESTORE EVERYTHING AND START 🔥
 async function restoreProjects() {
     console.log("🔄 Restoring Projects from MongoDB...");
     try {
-        // Fetch ALL projects that were running or active
-        const allProjects = await projectsCol.find({}).toArray(); // Fetch all to be safe, or check status
-        
+        const allProjects = await projectsCol.find({}).toArray();
         for (const proj of allProjects) {
-            // Only restore if it was running OR user expects it there
-            if (proj.status === "Running" || true) { // Force restore everything to be safe
+            if (proj.status === "Running" || true) {
                 const dir = path.join(__dirname, 'deployments', proj.user_id.toString(), proj.name);
-                
-                // Recreate Directory
                 if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-                
-                // Restore Files from DB to Disk
                 if (proj.files) { 
                     for (const file of proj.files) {
                         const filePath = path.join(dir, file.name);
@@ -681,11 +630,9 @@ async function restoreProjects() {
                         fs.writeFileSync(filePath, file.content.buffer);
                     }
                 }
-                
-                // If it was marked as "Running", start it automatically
                 if (proj.status === "Running") {
                     console.log(`✅ Restarting: ${proj.name}`);
-                    startProject(proj.user_id, proj.name, null, true); // Silent start
+                    startProject(proj.user_id, proj.name, null, true);
                 }
             }
         }
