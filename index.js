@@ -11,7 +11,6 @@ const MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.pr
 const OWNER_IDS = [8167904992, 7134046678, 6022286935]; 
 
 // ================= SETUP =================
-console.log("[INIT] Starting Master Bot v4.0...");
 const bot = new TelegramBot(TOKEN, { 
     polling: {
         interval: 300,
@@ -22,11 +21,8 @@ const bot = new TelegramBot(TOKEN, {
 
 // ANTI-CRASH: Polling Error Handler
 bot.on('polling_error', (error) => {
-    if (error.message.includes('409 Conflict')) {
-        console.log("⚠️ Conflict: Bot is running twice!");
-    } else {
-        console.log(`[Polling Error] ${error.message}`);
-    }
+    if (error.message.includes('409 Conflict')) return; // Ignore multiple instance warnings
+    console.log(`[Polling Error] ${error.message}`);
 });
 
 const client = new MongoClient(MONGO_URL, {
@@ -35,35 +31,34 @@ const client = new MongoClient(MONGO_URL, {
 });
 
 let db, projectsCol, keysCol, usersCol;
+
+// 🔥 GLOBAL CACHE & STATE
 const PROJECT_CACHE = {}; 
 const ACTIVE_SESSIONS = {}; 
 const USER_STATE = {}; 
 const FILE_WATCHERS = {}; 
 const LOG_DIR = path.join(__dirname, 'temp_logs');
 
-const IGNORED_LOGS = [
-    'Bad MAC', 'Decrypt', 'rate-overlimit', 'pre-key', 
-    'SessionEntry', 'Closing session', 'ratchet', 
-    'connection closed', 'QR', 'timeout', 'npm warn'
-];
+// Filter Spam Logs
+const IGNORED_LOGS = ['Bad MAC', 'Decrypt', 'rate-overlimit', 'pre-key', 'SessionEntry', 'Closing session'];
 
 if (fs.existsSync(LOG_DIR)) fs.rmSync(LOG_DIR, { recursive: true, force: true });
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
 // ================= DATABASE CONNECTION =================
 async function connectDB() {
-    console.log("[DB] 🟡 Connecting...");
     try {
         await client.connect();
         db = client.db("master_node_db");
         projectsCol = db.collection("projects");
         keysCol = db.collection("access_keys");
         usersCol = db.collection("users");
-        console.log("[DB] 🟢 Connected!");
+        console.log("✅ Connected to MongoDB");
+        
         startDBKeepAlive();
-        setTimeout(syncCacheAndRestore, 1000); 
+        setTimeout(syncCacheAndRestore, 2000); 
     } catch (e) {
-        console.error("[DB FAIL]", e.message);
+        console.error("❌ DB Error:", e);
         setTimeout(connectDB, 5000);
     }
 }
@@ -76,15 +71,8 @@ function startDBKeepAlive() {
     }, 5 * 60 * 1000); 
 }
 
-// ULTRA STRONG MARKDOWN ESCAPER
-function escapeMarkdown(text) {
-    if (!text) return "";
-    return text.toString().replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-}
-
-// SYNC DB -> RAM -> DISK
+// 🔥 SYNC RAM + DISK ON STARTUP
 async function syncCacheAndRestore() {
-    console.log("🔄 Syncing DB to Local Cache...");
     try {
         const allProjects = await projectsCol.find({}).toArray();
         for (const key in PROJECT_CACHE) delete PROJECT_CACHE[key];
@@ -109,11 +97,21 @@ async function syncCacheAndRestore() {
                 startProject(uid, proj._id, null, true);
             }
         }
-        console.log("🚀 System Ready!");
-    } catch (e) { console.error("Sync Error:", e); }
+        console.log("🚀 Projects Restored & Cache Ready!");
+    } catch (e) { console.error("Restore Error:", e); }
 }
 
-// ================= HELPERS =================
+// ================= HELPER FUNCTIONS =================
+
+function escapeMarkdown(text) {
+    if (!text) return "";
+    return text.toString().replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+}
+
+async function isAuthorized(userId) {
+    if (OWNER_IDS.includes(userId)) return true;
+    try { return !!(await usersCol.findOne({ user_id: userId })); } catch { return false; }
+}
 
 function getMainMenu(userId) {
     let keyboard = [
@@ -126,11 +124,6 @@ function getMainMenu(userId) {
     return { inline_keyboard: keyboard };
 }
 
-async function isAuthorized(userId) {
-    if (OWNER_IDS.includes(userId)) return true;
-    try { return !!(await usersCol.findOne({ user_id: userId })); } catch { return false; }
-}
-
 function getData(data, prefix) { return data.substring(prefix.length); }
 
 async function safeEditMessage(chatId, messageId, text, keyboard) {
@@ -139,27 +132,60 @@ async function safeEditMessage(chatId, messageId, text, keyboard) {
             chat_id: chatId, message_id: messageId,
             reply_markup: { inline_keyboard: keyboard }, parse_mode: 'MarkdownV2'
         });
-    } catch (e) {
-        await bot.sendMessage(chatId, text, {
-            reply_markup: { inline_keyboard: keyboard }, parse_mode: 'MarkdownV2'
-        });
+    } catch (error) {
+        try {
+            await bot.sendMessage(chatId, text, {
+                reply_markup: { inline_keyboard: keyboard }, parse_mode: 'MarkdownV2'
+            });
+        } catch (e) { }
     }
 }
 
-// DUAL SAVE: RAM + DB
+// 🔥 REPLACED: DUAL SAVE (RAM + DB)
 async function saveFileToStorage(userId, projId, relativePath, contentBuffer) {
-    if (PROJECT_CACHE[userId]) {
-        const projIndex = PROJECT_CACHE[userId].findIndex(p => p._id.toString() === projId.toString());
-        if (projIndex > -1) {
-            if (!PROJECT_CACHE[userId][projIndex].files) PROJECT_CACHE[userId][projIndex].files = [];
-            PROJECT_CACHE[userId][projIndex].files = PROJECT_CACHE[userId][projIndex].files.filter(f => f.name !== relativePath);
-            PROJECT_CACHE[userId][projIndex].files.push({ name: relativePath, content: contentBuffer });
+    try {
+        const safeId = new ObjectId(String(projId));
+        // Update RAM
+        if (PROJECT_CACHE[userId]) {
+            const p = PROJECT_CACHE[userId].find(x => x._id.toString() === safeId.toString());
+            if (p) {
+                if (!p.files) p.files = [];
+                p.files = p.files.filter(f => f.name !== relativePath);
+                p.files.push({ name: relativePath, content: contentBuffer });
+            }
         }
-    }
-    const safeId = new ObjectId(String(projId));
-    await projectsCol.updateOne({ _id: safeId }, { $pull: { files: { name: relativePath } } }).catch(()=>{});
-    await projectsCol.updateOne({ _id: safeId }, { $push: { files: { name: relativePath, content: contentBuffer } } }).catch(()=>{});
-    return true;
+        // Update DB
+        await projectsCol.updateOne({ _id: safeId }, { $pull: { files: { name: relativePath } } });
+        await projectsCol.updateOne({ _id: safeId }, { $push: { files: { name: relativePath, content: contentBuffer } } });
+        return true;
+    } catch (e) { return false; }
+}
+
+async function moveFile(userId, projData, basePath, fileName, targetFolder, chatId) {
+    const oldPath = path.join(basePath, fileName);
+    const newDir = path.join(basePath, targetFolder);
+    const newPath = path.join(newDir, fileName);
+    try {
+        if (!fs.existsSync(oldPath)) return bot.sendMessage(chatId, "⚠️ File not found.");
+        if (!fs.existsSync(newDir)) await fs.promises.mkdir(newDir, { recursive: true });
+        await fs.promises.rename(oldPath, newPath);
+        const fileContent = await fs.promises.readFile(newPath);
+        const relativePath = path.join(targetFolder, fileName).replace(/\\/g, '/');
+        await saveFileToStorage(userId, projData._id, relativePath, fileContent);
+        await projectsCol.updateOne({ _id: new ObjectId(String(projData._id)) }, { $pull: { files: { name: fileName } } });
+        await bot.sendMessage(chatId, `📂 Moved to \`${targetFolder}\``, { parse_mode: 'Markdown' });
+    } catch (e) { await bot.sendMessage(chatId, "❌ Move Error"); }
+}
+
+// ================= PROCESS MANAGEMENT =================
+
+function installDependencies(basePath, chatId) {
+    return new Promise((resolve, reject) => {
+        if (!fs.existsSync(path.join(basePath, 'package.json'))) return resolve();
+        if(chatId) bot.sendMessage(chatId, `📦 *Installing NPM Modules...*`, { parse_mode: 'Markdown' });
+        const install = spawn('npm', ['install'], { cwd: basePath, shell: true });
+        install.on('close', (code) => code === 0 ? resolve() : reject());
+    });
 }
 
 function startFullSyncWatcher(userId, projId, basePath) {
@@ -169,14 +195,9 @@ function startFullSyncWatcher(userId, projId, basePath) {
         const watcher = fs.watch(basePath, { recursive: true }, async (eventType, filename) => {
             if (filename && !filename.includes('node_modules') && !filename.includes('.git')) {
                 const fullPath = path.join(basePath, filename);
-                if (fs.existsSync(fullPath)) {
-                    try {
-                        const stats = fs.statSync(fullPath);
-                        if (stats.isFile()) {
-                            const content = fs.readFileSync(fullPath);
-                            saveFileToStorage(userId, projId, filename.replace(/\\/g, '/'), content);
-                        }
-                    } catch (err) {}
+                if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
+                    const content = fs.readFileSync(fullPath);
+                    saveFileToStorage(userId, projId, filename.replace(/\\/g, '/'), content);
                 }
             }
         });
@@ -192,14 +213,10 @@ async function forceStopProject(projId) {
         delete ACTIVE_SESSIONS[pid];
     }
     if (FILE_WATCHERS[pid]) { try { FILE_WATCHERS[pid].close(); } catch(e){} delete FILE_WATCHERS[pid]; }
-    for (const uid in PROJECT_CACHE) {
-        const p = PROJECT_CACHE[uid].find(x => x._id.toString() === pid);
-        if (p) p.status = "Stopped";
-    }
     await projectsCol.updateOne({ _id: new ObjectId(String(projId)) }, { $set: { status: "Stopped" } });
 }
 
-// ================= PROCESS ENGINE =================
+// ================= 🔥 MAIN START PROJECT 🔥 =================
 
 async function startProject(userId, projId, chatId, silent = false) {
     let projectData = null;
@@ -212,51 +229,65 @@ async function startProject(userId, projId, chatId, silent = false) {
     const pid = projId.toString();
 
     await forceStopProject(projId);
+    
     if (!silent && chatId) bot.sendMessage(chatId, `⏳ *Starting ${escapeMarkdown(projName)}...*`, { parse_mode: 'MarkdownV2' });
 
     if (!fs.existsSync(basePath)) fs.mkdirSync(basePath, { recursive: true });
+    
+    // Restore files from DB
     if (projectData.files) {
         for (const file of projectData.files) {
             const fullPath = path.join(basePath, file.name);
             const dir = path.dirname(fullPath);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-            if (!fs.existsSync(fullPath)) fs.writeFileSync(fullPath, file.content.buffer);
+            fs.writeFileSync(fullPath, file.content.buffer);
         }
     }
 
-    const pkgPath = path.join(basePath, 'package.json');
-    if (fs.existsSync(pkgPath) && !fs.existsSync(path.join(basePath, 'node_modules'))) {
-        try { await installDependencies(basePath, chatId); } catch (err) { return; }
+    // Dependency check
+    if (fs.existsSync(path.join(basePath, 'package.json')) && !fs.existsSync(path.join(basePath, 'node_modules'))) {
+        try { await installDependencies(basePath, chatId); } catch (e) { return; }
     }
 
     const child = spawn('node', ['index.js'], { cwd: basePath, stdio: ['pipe', 'pipe', 'pipe'] });
     const logFilePath = path.join(LOG_DIR, `${pid}.txt`);
     const logStream = fs.createWriteStream(logFilePath, { flags: 'w' });
 
-    ACTIVE_SESSIONS[pid] = { process: child, logging: true, logStream: logStream, chatId: chatId, name: projName };
+    ACTIVE_SESSIONS[pid] = { 
+        process: child, 
+        logging: true, 
+        logStream: logStream, 
+        chatId: chatId, 
+        name: projName 
+    };
+
     startFullSyncWatcher(userId, projId, basePath);
-    
-    projectData.status = "Running";
-    projectsCol.updateOne({ _id: new ObjectId(String(projId)) }, { $set: { status: "Running", path: basePath } });
+    await projectsCol.updateOne({ _id: new ObjectId(String(projId)) }, { $set: { status: "Running", path: basePath } });
 
     const handleLog = (data, isError) => {
         const raw = data.toString();
         logStream.write(raw);
         if (!chatId) return;
         const clean = raw.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
+        
         if (IGNORED_LOGS.some(ign => clean.includes(ign))) return;
 
+        // Pairing Code
         const codeMatch = clean.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/) || clean.match(/Pairing Code:\s*([A-Z0-9-]{8,})/i);
-        if (codeMatch) return bot.sendMessage(chatId, `🔑 *PAIRING CODE:*\n\`${escapeMarkdown(codeMatch[1] || codeMatch[0])}\``, { parse_mode: "MarkdownV2" });
+        if (codeMatch) return bot.sendMessage(chatId, `🔑 *PAIRING CODE:*\n\`${codeMatch[1] || codeMatch[0]}\``, { parse_mode: "MarkdownV2" });
 
-        if (clean.toLowerCase().includes("connected")) {
-            bot.sendMessage(chatId, `✅ *Active:* ${escapeMarkdown(projName)}`, { parse_mode: "MarkdownV2" });
+        // Auto Mute on Success
+        if (clean.toLowerCase().includes("connected") || clean.toLowerCase().includes("bot is live")) {
+            bot.sendMessage(chatId, `✅ *${escapeMarkdown(projName)} is Live!*`, { parse_mode: "MarkdownV2" });
             ACTIVE_SESSIONS[pid].logging = false;
             return;
         }
 
-        if (isError && ACTIVE_SESSIONS[pid].logging) {
-            bot.sendMessage(chatId, `⚠️ *Log:*\n\`${escapeMarkdown(clean.slice(0, 300))}\``, { parse_mode: "MarkdownV2" }).catch(()=>{});
+        // Live Log output
+        if (ACTIVE_SESSIONS[pid].logging) {
+            if (clean.trim().length > 0) {
+                bot.sendMessage(chatId, `🖥️ \`${escapeMarkdown(clean.slice(0, 400))}\``, { parse_mode: "MarkdownV2" }).catch(()=>{});
+            }
         }
     };
 
@@ -268,81 +299,99 @@ async function startProject(userId, projId, chatId, silent = false) {
     });
 }
 
-function installDependencies(basePath, chatId) {
-    return new Promise((resolve, reject) => {
-        if(chatId) bot.sendMessage(chatId, `📦 *Installing Modules...*`);
-        const install = spawn('npm', ['install'], { cwd: basePath, shell: true });
-        install.on('close', (code) => code === 0 ? resolve() : reject());
-    });
-}
-
-// ================= HANDLERS =================
+// ================= MESSAGE HANDLERS =================
 
 bot.on('message', async (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const text = msg.text;
+    try {
+        const chatId = msg.chat.id;
+        const userId = msg.from.id;
+        const text = msg.text;
 
-    if (text && text.startsWith("/start")) {
-        const args = text.split(" ");
-        if (args[1]) {
-            const keyDoc = await keysCol.findOne({ key: args[1], status: "active" });
-            if (keyDoc) {
-                await usersCol.insertOne({ user_id: userId, joined_at: new Date() });
-                await keysCol.updateOne({ key: args[1] }, { $set: { status: "used", used_by: userId } });
-                return bot.sendMessage(chatId, "✅ *Access Granted!*", { reply_markup: getMainMenu(userId), parse_mode: 'MarkdownV2' });
+        if (text && text.startsWith("/start")) {
+            if (await isAuthorized(userId)) {
+                bot.sendMessage(chatId, "👋 *Master Bot Manager*", { reply_markup: getMainMenu(userId), parse_mode: 'MarkdownV2' });
+            } else {
+                bot.sendMessage(chatId, "🔒 Private Access Only.");
             }
-        }
-        if (await isAuthorized(userId)) bot.sendMessage(chatId, "👋 *Master Bot*", { reply_markup: getMainMenu(userId), parse_mode: 'MarkdownV2' });
-        else bot.sendMessage(chatId, "🔒 Access Denied.");
-        return;
-    }
-
-    if (USER_STATE[userId]) {
-        if (text === "✅ Done / Apply Actions") {
-            const projData = USER_STATE[userId].data;
-            const step = USER_STATE[userId].step;
-            delete USER_STATE[userId];
-            const m = await bot.sendMessage(chatId, "⚙️ *Applying...*", { reply_markup: { remove_keyboard: true } });
-            if (step === "update_files") await forceStopProject(projData._id);
-            setTimeout(() => { startProject(userId, projData._id, chatId); bot.deleteMessage(chatId, m.message_id); }, 2000);
             return;
         }
-        if (USER_STATE[userId].step === "ask_name") {
-            const name = text.trim();
-            const res = await projectsCol.insertOne({ user_id: userId, name: name, files: [], status: "Stopped" });
-            const newProj = { _id: res.insertedId, user_id: userId, name: name, files: [], status: "Stopped" };
-            if (!PROJECT_CACHE[userId]) PROJECT_CACHE[userId] = [];
-            PROJECT_CACHE[userId].push(newProj);
-            USER_STATE[userId] = { step: "wait_files", data: newProj };
-            bot.sendMessage(chatId, `✅ Created: *${escapeMarkdown(name)}*\nSend files now.`, {
-                reply_markup: { resize_keyboard: true, keyboard: [[{ text: "✅ Done / Apply Actions" }]] }, parse_mode: 'MarkdownV2'
-            });
+
+        if (USER_STATE[userId]) {
+            // ✅ DONE BUTTON LOGIC
+            if (text === "✅ Done / Apply Actions") {
+                const projData = USER_STATE[userId].data;
+                const isUpd = USER_STATE[userId].step === "update_files";
+                delete USER_STATE[userId];
+                const status = await bot.sendMessage(chatId, "⚙️ *Restarting with new files...*", { reply_markup: { remove_keyboard: true } });
+                
+                if (isUpd) await forceStopProject(projData._id);
+                setTimeout(() => {
+                    startProject(userId, projData._id, chatId);
+                    bot.deleteMessage(chatId, status.message_id).catch(()=>{});
+                }, 2000);
+                return;
+            }
+
+            // ASK NAME LOGIC
+            if (USER_STATE[userId].step === "ask_name") {
+                const name = text.trim();
+                const res = await projectsCol.insertOne({ user_id: userId, name: name, files: [], status: "Stopped" });
+                const newProj = { _id: res.insertedId, user_id: userId, name: name, files: [], status: "Stopped" };
+                if (!PROJECT_CACHE[userId]) PROJECT_CACHE[userId] = [];
+                PROJECT_CACHE[userId].push(newProj);
+                USER_STATE[userId] = { step: "wait_files", data: newProj };
+                bot.sendMessage(chatId, `✅ Created: *${escapeMarkdown(name)}*\nSend files now.`, {
+                    reply_markup: { resize_keyboard: true, keyboard: [[{ text: "✅ Done / Apply Actions" }]] }, parse_mode: 'MarkdownV2'
+                });
+            }
+        } 
+        
+        else {
+            // Manual Console Input
+            let targetPid = null;
+            for (const [pid, session] of Object.entries(ACTIVE_SESSIONS)) {
+                if (session.chatId === chatId) { targetPid = pid; break; }
+            }
+            if (targetPid && text && !text.startsWith("/")) {
+                const session = ACTIVE_SESSIONS[targetPid];
+                if (session.process && !session.process.killed) {
+                    try { session.process.stdin.write(text + "\n"); } catch (e) { }
+                }
+            }
         }
-    }
+    } catch (err) { }
 });
 
 bot.on('document', async (msg) => {
     const userId = msg.from.id;
-    if (USER_STATE[userId] && USER_STATE[userId].step.includes("files")) {
+    if (USER_STATE[userId] && (USER_STATE[userId].step === "wait_files" || USER_STATE[userId].step === "update_files")) {
         const projData = USER_STATE[userId].data;
-        const dir = path.join(__dirname, 'deployments', userId.toString(), projData.name);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        const filePath = path.join(dir, msg.document.file_name);
+        const fileName = msg.document.file_name;
+        const loading = await bot.sendMessage(msg.chat.id, `📥 *Uploading:* \`${escapeMarkdown(fileName)}\``, { parse_mode: 'MarkdownV2' });
+
         const fileLink = await bot.getFileLink(msg.document.file_id);
         const response = await fetch(fileLink);
         const buffer = await response.arrayBuffer();
-        fs.writeFileSync(filePath, Buffer.from(buffer));
-        await saveFileToStorage(userId, projData._id, msg.document.file_name, Buffer.from(buffer));
-        bot.sendMessage(msg.chat.id, `✅ *Saved:* \`${escapeMarkdown(msg.document.file_name)}\``, { parse_mode: 'MarkdownV2' });
+        
+        // Save to Disk
+        const dir = path.join(__dirname, 'deployments', userId.toString(), projData.name);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, fileName), Buffer.from(buffer));
+
+        // Save to RAM + DB
+        await saveFileToStorage(userId, projData._id, fileName, Buffer.from(buffer));
+        bot.editMessageText(`✅ *Saved:* \`${escapeMarkdown(fileName)}\``, { chat_id: msg.chat.id, message_id: loading.message_id, parse_mode: 'MarkdownV2' }).catch(()=>{});
     }
 });
+
+// ================= CALLBACK HANDLING =================
 
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const userId = query.from.id;
     const data = query.data;
     const messageId = query.message.message_id;
+
     try { await bot.answerCallbackQuery(query.id); } catch(e) {}
 
     if (data === "manage_projects") {
@@ -351,59 +400,65 @@ bot.on('callback_query', async (query) => {
         keyboard.push([{ text: "🔙 Back", callback_data: "main_menu" }]);
         await safeEditMessage(chatId, messageId, "📂 *Your Projects*", keyboard);
     }
+    
     else if (data.startsWith("menu_")) {
         const projId = getData(data, "menu_");
-        const proj = (PROJECT_CACHE[userId] || []).find(p => p._id.toString() === projId);
+        const projects = PROJECT_CACHE[userId] || [];
+        const proj = projects.find(p => p._id.toString() === projId);
         if (!proj) return;
+
         const isRunning = proj.status === "Running";
+        const isLogging = (ACTIVE_SESSIONS[projId] && ACTIVE_SESSIONS[projId].logging);
+
         const keyboard = [
-            [{ text: isRunning ? "🛑 Stop" : "▶️ Start", callback_data: `tog_run_${projId}` }, { text: "📝 Update", callback_data: `upd_${projId}` }],
-            [{ text: "📥 Logs", callback_data: `get_logs_${projId}` }, { text: "🔄 Renew Session", callback_data: `renew_${projId}` }],
-            [{ text: "🗑️ Delete", callback_data: `del_${projId}` }, { text: "🔙 Back", callback_data: "manage_projects" }]
+            [{ text: isRunning ? "🛑 Stop" : "▶️ Start", callback_data: `tog_run_${projId}` }, { text: isLogging ? "🔴 No Logs" : "🟢 Live Logs", callback_data: `tog_log_${projId}` }],
+            [{ text: "📝 Update Files", callback_data: `upd_${projId}` }, { text: "📥 Get Log File", callback_data: `get_logs_${projId}` }],
+            [{ text: "🔄 Renew Session", callback_data: `renew_${projId}` }, { text: "🗑️ Delete", callback_data: `del_${projId}` }],
+            [{ text: "🔙 Back", callback_data: "manage_projects" }]
         ];
-        await safeEditMessage(chatId, messageId, `⚙️ *${escapeMarkdown(proj.name)}*`, keyboard);
+        await safeEditMessage(chatId, messageId, `⚙️ *Manage:* ${escapeMarkdown(proj.name)}\nStatus: ${isRunning ? "Running 🟢" : "Stopped 🔴"}`, keyboard);
     }
+
     else if (data.startsWith("tog_run_")) {
         const projId = getData(data, "tog_run_");
         if (ACTIVE_SESSIONS[projId]) await forceStopProject(projId);
-        else startProject(userId, projId, chatId);
+        else await startProject(userId, projId, chatId);
         setTimeout(() => bot.emit('callback_query', { ...query, data: `menu_${projId}` }), 1000);
     }
+
+    else if (data.startsWith("tog_log_")) {
+        const projId = getData(data, "tog_log_");
+        if (ACTIVE_SESSIONS[projId]) ACTIVE_SESSIONS[projId].logging = !ACTIVE_SESSIONS[projId].logging;
+        bot.emit('callback_query', { ...query, data: `menu_${projId}` });
+    }
+
     else if (data.startsWith("upd_")) {
         const projId = getData(data, "upd_");
         const proj = (PROJECT_CACHE[userId] || []).find(p => p._id.toString() === projId);
         USER_STATE[userId] = { step: "update_files", data: proj };
-        bot.sendMessage(chatId, `📝 *Update: ${escapeMarkdown(proj.name)}*\nSend files now.`, {
+        bot.sendMessage(chatId, `📝 *Update Mode:* ${escapeMarkdown(proj.name)}\nSend new files now.`, {
             reply_markup: { resize_keyboard: true, keyboard: [[{ text: "✅ Done / Apply Actions" }]] }, parse_mode: 'MarkdownV2'
         });
     }
-    else if (data.startsWith("del_")) {
-        const projId = getData(data, "del_");
-        await forceStopProject(projId);
-        await projectsCol.deleteOne({ _id: new ObjectId(projId) });
-        PROJECT_CACHE[userId] = PROJECT_CACHE[userId].filter(p => p._id.toString() !== projId);
-        bot.sendMessage(chatId, "🗑️ Deleted.");
-        bot.emit('callback_query', { ...query, data: "manage_projects" });
+
+    else if (data.startsWith("get_logs_")) {
+        const projId = getData(data, "get_logs_");
+        const logFile = path.join(LOG_DIR, `${projId}.txt`);
+        if (fs.existsSync(logFile)) bot.sendDocument(chatId, logFile);
+        else bot.sendMessage(chatId, "❌ No logs available.");
     }
+
     else if (data === "deploy_new") {
         USER_STATE[userId] = { step: "ask_name" };
         bot.sendMessage(chatId, "📂 Enter Project Name:");
     }
+
     else if (data === "main_menu") {
         await safeEditMessage(chatId, messageId, "🏠 Main Menu", getMainMenu(userId).inline_keyboard);
     }
-    else if (data.startsWith("get_logs_")) {
-        const logFile = path.join(LOG_DIR, `${getData(data, "get_logs_")}.txt`);
-        if (fs.existsSync(logFile)) bot.sendDocument(chatId, logFile);
-        else bot.sendMessage(chatId, "❌ No Logs.");
-    }
-    else if (data === "owner_panel") {
-        const keyboard = [[{ text: "🔑 Gen Key", callback_data: "gen_key" }], [{ text: "🔙 Back", callback_data: "main_menu" }]];
-        await safeEditMessage(chatId, messageId, "👑 *Owner Panel*", keyboard);
-    }
-    else if (data === "gen_key") {
-        const key = uuid.v4().split('-')[0];
-        await keysCol.insertOne({ key: key, status: "active" });
-        bot.sendMessage(chatId, `🔑 *New Key:* \`${key}\``, { parse_mode: 'MarkdownV2' });
-    }
 });
+
+// Old restore function compatibility
+async function restoreProjects() { syncCacheAndRestore(); }
+
+bot.on('polling_error', (e) => console.log(e.message));
