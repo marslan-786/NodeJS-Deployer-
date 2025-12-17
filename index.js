@@ -11,12 +11,21 @@ const MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.pr
 const OWNER_IDS = [8167904992, 7134046678, 6022286935]; 
 
 // ================= SETUP =================
-console.log("[INIT] Starting Master Bot v3.0 (Session Persist)...");
+console.log("[INIT] Starting Master Bot v3.1 (Stable Logs)...");
 const bot = new TelegramBot(TOKEN, { 
     polling: {
         interval: 300,
         autoStart: true,
         params: { timeout: 10 }
+    }
+});
+
+// 🔥 FIX 1: Handle Polling Errors (Prevent Crash on 409)
+bot.on('polling_error', (error) => {
+    if (error.message.includes('409 Conflict')) {
+        console.log("⚠️ Conflict Error: Bot is running somewhere else too! Please stop other instances.");
+    } else {
+        console.log(`[Polling Error] ${error.message}`);
     }
 });
 
@@ -26,27 +35,23 @@ const client = new MongoClient(MONGO_URL, {
 });
 
 let db, projectsCol, keysCol, usersCol;
-
-// 🔥 RAM CACHE (Mirror of DB)
 const PROJECT_CACHE = {}; 
-
-// Global Variables
 const ACTIVE_SESSIONS = {}; 
 const USER_STATE = {}; 
 const FILE_WATCHERS = {}; 
 const LOG_DIR = path.join(__dirname, 'temp_logs');
 
-// Errors to HIDE from Chat (But save to file)
+// Ignore these logs in chat (Anti-Spam)
 const IGNORED_LOGS = [
     'Bad MAC', 'Decrypt', 'rate-overlimit', 'pre-key', 
     'SessionEntry', 'Closing session', 'ratchet', 
-    'connection closed', 'QR', 'timeout'
+    'connection closed', 'QR', 'timeout', 'npm warn'
 ];
 
 if (fs.existsSync(LOG_DIR)) fs.rmSync(LOG_DIR, { recursive: true, force: true });
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
-// ================= DATABASE CONNECTION =================
+// ================= DATABASE =================
 async function connectDB() {
     console.log("[DB] 🟡 Connecting...");
     try {
@@ -56,7 +61,6 @@ async function connectDB() {
         keysCol = db.collection("access_keys");
         usersCol = db.collection("users");
         console.log("[DB] 🟢 Connected!");
-        
         startDBKeepAlive();
         setTimeout(syncCacheAndRestore, 1000); 
     } catch (e) {
@@ -73,7 +77,13 @@ function startDBKeepAlive() {
     }, 5 * 60 * 1000); 
 }
 
-// 🔥 SYNC DB -> RAM -> DISK (On Startup)
+// 🔥 FIX 2: ULTRA STRONG MARKDOWN ESCAPER
+function escapeMarkdown(text) {
+    if (!text) return "";
+    // Escapes ALL special characters required by Telegram MarkdownV2
+    return text.toString().replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+}
+
 async function syncCacheAndRestore() {
     console.log("🔄 Syncing DB to Local Cache...");
     try {
@@ -88,7 +98,6 @@ async function syncCacheAndRestore() {
             const dir = path.join(__dirname, 'deployments', uid.toString(), proj.name);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
             
-            // Restore ALL files (Including Session)
             if (proj.files) {
                 for (const file of proj.files) {
                     const filePath = path.join(dir, file.name);
@@ -107,63 +116,38 @@ async function syncCacheAndRestore() {
     } catch (e) { console.error("Sync Error:", e); }
 }
 
-// ================= CORE FUNCTIONS =================
-
-// 🔥 DUAL SAVE: RAM + DB (Persistent)
 async function saveFileToStorage(userId, projId, relativePath, contentBuffer) {
-    // 1. Update RAM Cache
     if (PROJECT_CACHE[userId]) {
         const projIndex = PROJECT_CACHE[userId].findIndex(p => p._id.toString() === projId.toString());
         if (projIndex > -1) {
             if (!PROJECT_CACHE[userId][projIndex].files) PROJECT_CACHE[userId][projIndex].files = [];
-            // Remove old version
             PROJECT_CACHE[userId][projIndex].files = PROJECT_CACHE[userId][projIndex].files.filter(f => f.name !== relativePath);
-            // Add new version
             PROJECT_CACHE[userId][projIndex].files.push({ name: relativePath, content: contentBuffer });
         }
     }
-
-    // 2. Update DB (Upsert Logic)
     const safeId = new ObjectId(String(projId));
-    
-    // Pehle remove karo (Agar exist karta hai)
-    await projectsCol.updateOne(
-        { _id: safeId },
-        { $pull: { files: { name: relativePath } } }
-    ).catch(()=>{});
-
-    // Phir Add karo
-    await projectsCol.updateOne(
-        { _id: safeId },
-        { $push: { files: { name: relativePath, content: contentBuffer } } }
-    ).catch(()=>{});
-
+    await projectsCol.updateOne({ _id: safeId }, { $pull: { files: { name: relativePath } } }).catch(()=>{});
+    await projectsCol.updateOne({ _id: safeId }, { $push: { files: { name: relativePath, content: contentBuffer } } }).catch(()=>{});
     return true;
 }
 
 function startFullSyncWatcher(userId, projId, basePath) {
     const watcherId = projId.toString();
     if (FILE_WATCHERS[watcherId]) try { FILE_WATCHERS[watcherId].close(); } catch(e){}
-
     try {
-        // 🔥 Watch EVERYTHING except node_modules (Sessions included)
         const watcher = fs.watch(basePath, { recursive: true }, async (eventType, filename) => {
             if (filename && !filename.includes('node_modules') && !filename.includes('.git')) {
                 const fullPath = path.join(basePath, filename);
-                
-                // File Changed/Added
                 if (fs.existsSync(fullPath)) {
                     try {
                         const stats = fs.statSync(fullPath);
                         if (stats.isFile()) {
                             const content = fs.readFileSync(fullPath);
                             const relativePath = filename.replace(/\\/g, '/');
-                            // Save Session Files to DB automatically
                             saveFileToStorage(userId, projId, relativePath, content);
                         }
                     } catch (err) {}
                 }
-                // File Deleted Logic (Optional: We keep in DB for safety usually)
             }
         });
         FILE_WATCHERS[watcherId] = watcher;
@@ -177,18 +161,12 @@ async function forceStopProject(projId) {
         try { ACTIVE_SESSIONS[pid].logStream.end(); } catch(e){}
         delete ACTIVE_SESSIONS[pid];
     }
-    if (FILE_WATCHERS[pid]) {
-        try { FILE_WATCHERS[pid].close(); } catch(e){}
-        delete FILE_WATCHERS[pid];
-    }
+    if (FILE_WATCHERS[pid]) { try { FILE_WATCHERS[pid].close(); } catch(e){} delete FILE_WATCHERS[pid]; }
     
-    // RAM Status Update
     for (const uid in PROJECT_CACHE) {
         const p = PROJECT_CACHE[uid].find(x => x._id.toString() === pid);
         if (p) p.status = "Stopped";
     }
-    
-    // DB Status Update
     await projectsCol.updateOne({ _id: new ObjectId(String(projId)) }, { $set: { status: "Stopped" } });
 }
 
@@ -196,8 +174,6 @@ async function renewSession(userId, projId, chatId, basePath) {
     try {
         await forceStopProject(projId);
         const safeId = new ObjectId(String(projId));
-        
-        // 🔥 ONLY HERE we delete session from DB
         await projectsCol.updateOne({ _id: safeId }, { $pull: { files: { name: { $regex: /^session\// } } } });
         await projectsCol.updateOne({ _id: safeId }, { $pull: { files: { name: { $regex: /^auth_info_baileys\// } } } });
 
@@ -206,18 +182,16 @@ async function renewSession(userId, projId, chatId, basePath) {
         if (fs.existsSync(sessionPath)) fs.rmSync(sessionPath, { recursive: true, force: true });
         if (fs.existsSync(authPath)) fs.rmSync(authPath, { recursive: true, force: true });
 
-        // Cache clear logic
+        // Clear local cache
         if(PROJECT_CACHE[userId]) {
             const p = PROJECT_CACHE[userId].find(x => x._id.toString() === String(projId));
             if(p) p.files = p.files.filter(f => !f.name.includes('session/') && !f.name.includes('auth_info_baileys/'));
         }
 
-        if(chatId) bot.sendMessage(chatId, `🔄 *Session Reset Done.*\nStarting fresh...`, { parse_mode: 'Markdown' }).catch(e => {});
+        if(chatId) bot.sendMessage(chatId, `🔄 *Session Reset Done*`, { parse_mode: 'MarkdownV2' }).catch(e => {});
         setTimeout(() => startProject(userId, projId, chatId), 2000);
     } catch (e) {}
 }
-
-// ================= 🔥 MAIN START PROJECT 🔥 =================
 
 async function startProject(userId, projId, chatId, silent = false) {
     let projectData = null;
@@ -229,13 +203,10 @@ async function startProject(userId, projId, chatId, silent = false) {
     const basePath = path.join(__dirname, 'deployments', userId.toString(), projName);
     const pid = projId.toString();
 
-    // 1. Kill Old Process
     await forceStopProject(projId);
     
-    const safeName = escapeMarkdown(projName);
-    if (!silent && chatId) bot.sendMessage(chatId, `⏳ *Starting ${safeName}...*`, { parse_mode: 'Markdown' }).catch(e => {});
+    if (!silent && chatId) bot.sendMessage(chatId, `⏳ *Starting ${escapeMarkdown(projName)}...*`, { parse_mode: 'MarkdownV2' }).catch(e => {});
 
-    // 2. Ensure Files Exist (RAM -> Disk)
     if (!fs.existsSync(basePath)) fs.mkdirSync(basePath, { recursive: true });
     
     if (projectData.files) {
@@ -243,12 +214,10 @@ async function startProject(userId, projId, chatId, silent = false) {
             const fullPath = path.join(basePath, file.name);
             const dir = path.dirname(fullPath);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-            // Only overwrite if size differs or missing (Optimization)
             if (!fs.existsSync(fullPath)) fs.writeFileSync(fullPath, file.content.buffer);
         }
     }
 
-    // 3. Dependencies
     const pkgPath = path.join(basePath, 'package.json');
     const modulesPath = path.join(basePath, 'node_modules');
     if (fs.existsSync(pkgPath) && !fs.existsSync(modulesPath)) {
@@ -259,7 +228,6 @@ async function startProject(userId, projId, chatId, silent = false) {
         }
     }
 
-    // 4. Launch
     const child = spawn('node', ['index.js'], { cwd: basePath, stdio: ['pipe', 'pipe', 'pipe'] });
     const logFilePath = path.join(LOG_DIR, `${pid}.txt`);
     const logStream = fs.createWriteStream(logFilePath, { flags: 'w' });
@@ -273,33 +241,27 @@ async function startProject(userId, projId, chatId, silent = false) {
         name: projName
     };
 
-    // 5. Watch for Session Changes
     startFullSyncWatcher(userId, projId, basePath);
     
-    // Update Status
     projectData.status = "Running";
     projectsCol.updateOne({ _id: new ObjectId(String(projId)) }, { $set: { status: "Running", path: basePath } });
 
-    // --- LOG FILTERING ---
+    // --- SAFER LOG HANDLING ---
     const handleLog = (data, isError) => {
         const raw = data.toString();
-        logStream.write(raw); // Always save to file
+        logStream.write(raw);
         if (!chatId) return;
 
         const clean = raw.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
-        
-        // 🔥 FILTER: Don't show spam logs
         if (IGNORED_LOGS.some(ign => clean.includes(ign))) return;
 
-        // Pairing Code Logic
         const codeMatch = clean.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/) || clean.match(/Pairing Code:\s*([A-Z0-9-]{8,})/i);
         if (codeMatch) {
             let code = codeMatch[1] || codeMatch[0];
-            bot.sendMessage(chatId, `🔑 *PAIRING CODE:*\n\`${code}\``, { parse_mode: "MarkdownV2" }).catch(()=>{});
+            bot.sendMessage(chatId, `🔑 *PAIRING CODE:*\n\`${escapeMarkdown(code)}\``, { parse_mode: "MarkdownV2" }).catch(()=>{});
             return;
         }
 
-        // Success Logic
         if (clean.toLowerCase().includes("connected") || clean.toLowerCase().includes("success")) {
             bot.sendMessage(chatId, `✅ *Active:* ${escapeMarkdown(projName)}`, { parse_mode: "MarkdownV2" }).catch(()=>{});
             if (ACTIVE_SESSIONS[pid].logging) {
@@ -309,9 +271,15 @@ async function startProject(userId, projId, chatId, silent = false) {
             return;
         }
 
-        // Critical Errors only
         if (isError && ACTIVE_SESSIONS[pid].logging) {
-             bot.sendMessage(chatId, `⚠️ *Log:*\n\`${escapeMarkdown(clean.slice(0, 200))}\``, { parse_mode: "MarkdownV2" }).catch(()=>{});
+             // 🔥 FIX: TRY-CATCH FOR SENDING LOGS TO AVOID 400 ERROR
+             try {
+                 const safeLog = escapeMarkdown(clean.slice(0, 300));
+                 bot.sendMessage(chatId, `⚠️ *Log:*\n\`${safeLog}\``, { parse_mode: "MarkdownV2" }).catch(e => {
+                     // If still fails, send as plain text
+                     bot.sendMessage(chatId, `⚠️ Log Error: ${clean.slice(0, 100)}`);
+                 });
+             } catch(e) {}
         }
     };
 
@@ -321,10 +289,8 @@ async function startProject(userId, projId, chatId, silent = false) {
     child.on('close', (code) => {
         if(ACTIVE_SESSIONS[pid]) delete ACTIVE_SESSIONS[pid];
         if (FILE_WATCHERS[pid]) try { FILE_WATCHERS[pid].close(); } catch(e){}
-        
         projectData.status = "Stopped";
         projectsCol.updateOne({ _id: new ObjectId(String(projId)) }, { $set: { status: "Stopped" } }).catch(()=>{});
-        
         if (chatId && !silent && ACTIVE_SESSIONS[pid]?.logging) { 
              bot.sendMessage(chatId, `🛑 *Stopped* (Code ${code})`).catch(()=>{});
         }
@@ -339,8 +305,6 @@ function installDependencies(basePath, chatId) {
     });
 }
 
-// ================= MESSAGE HANDLERS =================
-
 bot.on('message', async (msg) => {
     try {
         const chatId = msg.chat.id;
@@ -349,7 +313,7 @@ bot.on('message', async (msg) => {
 
         if (text && text.startsWith("/start")) {
             if (await isAuthorized(userId)) {
-                bot.sendMessage(chatId, "👋 *Master Bot v3.0*", { reply_markup: getMainMenu(userId), parse_mode: 'MarkdownV2' });
+                bot.sendMessage(chatId, "👋 *Master Bot*", { reply_markup: getMainMenu(userId), parse_mode: 'MarkdownV2' });
             } else {
                 bot.sendMessage(chatId, "🔒 Access Denied");
             }
@@ -357,16 +321,12 @@ bot.on('message', async (msg) => {
         }
 
         if (USER_STATE[userId]) {
-            // 🔥 RESTART ON DONE
             if (text === "✅ Done / Apply Actions") {
                 if (USER_STATE[userId].step.includes("files")) {
                     const projData = USER_STATE[userId].data;
                     const isUpdate = USER_STATE[userId].step === "update_files";
                     delete USER_STATE[userId]; 
-                    
                     const m = await bot.sendMessage(chatId, "⚙️ *Applying & Restarting...*", { reply_markup: { remove_keyboard: true }, parse_mode: 'Markdown' });
-                    
-                    // Kill first, then Start (ensures DB is updated)
                     if (isUpdate) await forceStopProject(projData._id);
                     setTimeout(() => {
                         startProject(userId, projData._id, chatId);
@@ -375,13 +335,9 @@ bot.on('message', async (msg) => {
                     return;
                 }
             }
-
-            // ... (Name creation logic same as before) ...
             if (USER_STATE[userId].step === "ask_name") {
                 const projName = text.trim(); 
-                if (PROJECT_CACHE[userId] && PROJECT_CACHE[userId].find(p => p.name === projName)) {
-                    return bot.sendMessage(chatId, "❌ Name taken.");
-                }
+                if (PROJECT_CACHE[userId] && PROJECT_CACHE[userId].find(p => p.name === projName)) return bot.sendMessage(chatId, "❌ Name taken.");
                 const res = await projectsCol.insertOne({ user_id: userId, name: projName, files: [], status: "Stopped" });
                 const newProj = { _id: res.insertedId, user_id: userId, name: projName, files: [], status: "Stopped" };
                 if (!PROJECT_CACHE[userId]) PROJECT_CACHE[userId] = [];
@@ -401,27 +357,19 @@ bot.on('document', async (msg) => {
             const projData = USER_STATE[userId].data;
             const fileName = msg.document.file_name;
             const dir = path.join(__dirname, 'deployments', userId.toString(), projData.name);
-            
             const loadingMsg = await bot.sendMessage(msg.chat.id, `📥 *Uploading:* \`${escapeMarkdown(fileName)}\``, { parse_mode: 'MarkdownV2' });
-
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
             const filePath = path.join(dir, fileName);
             const fileLink = await bot.getFileLink(msg.document.file_id);
             const response = await fetch(fileLink);
             const buffer = await response.arrayBuffer();
-            
-            // Write to Disk (Instant)
             fs.writeFileSync(filePath, Buffer.from(buffer));
-            
-            // Save to DB & Cache (Background)
             await saveFileToStorage(userId, projData._id, fileName, Buffer.from(buffer));
-
             bot.editMessageText(`✅ *Updated:* \`${escapeMarkdown(fileName)}\``, { chat_id: msg.chat.id, message_id: loadingMsg.message_id, parse_mode: 'MarkdownV2' }).catch(()=>{});
         }
     } catch (err) { }
 });
 
-// ... (Callback handlers same as before - just ensure buttons call startProject/forceStopProject) ...
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const userId = query.from.id;
@@ -429,14 +377,12 @@ bot.on('callback_query', async (query) => {
     const messageId = query.message.message_id;
     try { await bot.answerCallbackQuery(query.id); } catch(e) {}
 
-    // ... (Previous logic for menus, just ensure safeEditMessage is used) ...
     if (data === "manage_projects") {
         const projects = PROJECT_CACHE[userId] || [];
         const keyboard = projects.map(p => [{ text: `${p.status === "Running" ? "🟢" : "🔴"} ${p.name}`, callback_data: `menu_${p._id.toString()}` }]);
         keyboard.push([{ text: "🔙 Back", callback_data: "main_menu" }]);
         await safeEditMessage(chatId, messageId, "📂 *Your Projects*", keyboard);
     }
-    // ... Copy remaining handlers (menu_, tog_run_, del_, upd_, etc.) from previous robust code ...
     else if (data.startsWith("menu_")) {
         const projId = getData(data, "menu_");
         const proj = (PROJECT_CACHE[userId] || []).find(p => p._id.toString() === projId);
@@ -494,13 +440,12 @@ bot.on('callback_query', async (query) => {
         if (fs.existsSync(logFile)) bot.sendDocument(chatId, logFile);
         else bot.sendMessage(chatId, "❌ No Logs");
     }
+    else if (data === "owner_panel") {
+        if (!OWNER_IDS.includes(userId)) return bot.sendMessage(chatId, "⛔ Access Denied");
+        const keyboard = [[{ text: "🔙 Back", callback_data: "main_menu" }]];
+        await safeEditMessage(chatId, messageId, "👑 *Owner Panel (Coming Soon)*", keyboard);
+    }
 });
 
-// Helper imports
-function escapeMarkdown(text) { if (!text) return ""; return text.toString().replace(/[_*[\]()~\x60>#+\-=|{}.!]/g, '\\$&'); }
 async function isAuthorized(userId) { if (OWNER_IDS.includes(userId)) return true; try { return !!(await usersCol.findOne({ user_id: userId })); } catch { return false; } }
-function getMainMenu(userId) { let k = [[{ text: "🚀 Deploy", callback_data: "deploy_new" }], [{ text: "📂 Manage", callback_data: "manage_projects" }]]; if (OWNER_IDS.includes(userId)) k.push([{ text: "👑 Panel", callback_data: "owner_panel" }]); return { inline_keyboard: k }; }
-function getData(d, p) { return d.substring(p.length); }
-async function safeEditMessage(chatId, messageId, text, keyboard) { try { await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: keyboard }, parse_mode: 'MarkdownV2' }); } catch (e) { await bot.sendMessage(chatId, text, { reply_markup: { inline_keyboard: keyboard }, parse_mode: 'MarkdownV2' }); } }
-
-bot.on('polling_error', (e) => console.log(e.message));
+function getMainMenu(userId) { let k = [[{ text: "🚀 Deploy", callback_data: "deploy_new" }], [{ text: "📂 Manage", callback_data: "manage_projects" }]]; if (OWNER_IDS.includes(userId)) k.push([{ text: "👑 Panel", callback_data: "owner_panel"
