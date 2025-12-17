@@ -20,6 +20,7 @@ const bot = new TelegramBot(TOKEN, {
     }
 });
 
+// Fix: Removed unsupported options for newer Mongo drivers
 const client = new MongoClient(MONGO_URL, {
     connectTimeoutMS: 30000,
     socketTimeoutMS: 45000
@@ -27,8 +28,8 @@ const client = new MongoClient(MONGO_URL, {
 
 let db, projectsCol, keysCol, usersCol;
 
-// LOCAL CACHE
-const PROJECT_CACHE = {}; 
+// 🔥🔥🔥 LOCAL CACHE (THE SPEED SECRET) 🔥🔥🔥
+const PROJECT_CACHE = {}; // Structure: { userId: [project1, project2] }
 
 // Global Variables
 const ACTIVE_SESSIONS = {}; 
@@ -50,6 +51,8 @@ async function connectDB() {
         console.log("[DB] 🟢 Connected!");
         
         startDBKeepAlive();
+        
+        // 🔥 STARTUP: Load DB into RAM Cache
         setTimeout(syncCacheAndRestore, 1000); 
     } catch (e) {
         console.error("[DB FAIL]", e.message);
@@ -65,17 +68,22 @@ function startDBKeepAlive() {
     }, 5 * 60 * 1000); 
 }
 
+// 🔥🔥 SYNC CACHE FUNCTION 🔥🔥
 async function syncCacheAndRestore() {
     console.log("🔄 Syncing DB to Local Cache...");
     try {
         const allProjects = await projectsCol.find({}).toArray();
+        
+        // Clear Cache first
         for (const key in PROJECT_CACHE) delete PROJECT_CACHE[key];
 
+        // Populate Cache
         for (const proj of allProjects) {
             const uid = proj.user_id;
             if (!PROJECT_CACHE[uid]) PROJECT_CACHE[uid] = [];
             PROJECT_CACHE[uid].push(proj);
             
+            // Restore Files to Disk
             const dir = path.join(__dirname, 'deployments', uid.toString(), proj.name);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
             
@@ -93,7 +101,7 @@ async function syncCacheAndRestore() {
                 startProject(uid, proj._id, null, true);
             }
         }
-        console.log("🚀 Cache Synced!");
+        console.log("🚀 Cache Synced! Bot is ready.");
     } catch (e) { console.error("Sync Error:", e); }
 }
 
@@ -143,38 +151,47 @@ async function safeEditMessage(chatId, messageId, text, keyboard) {
     }
 }
 
+// 🔥 BACKGROUND SAVE (FIRE AND FORGET)
 async function saveFileToStorage(userId, projId, relativePath, contentBuffer) {
+    // 1. Update Local Cache (Instant)
     if (PROJECT_CACHE[userId]) {
         const projIndex = PROJECT_CACHE[userId].findIndex(p => p._id.toString() === projId.toString());
         if (projIndex > -1) {
+            if (!PROJECT_CACHE[userId][projIndex].files) PROJECT_CACHE[userId][projIndex].files = [];
+            
             PROJECT_CACHE[userId][projIndex].files = PROJECT_CACHE[userId][projIndex].files.filter(f => f.name !== relativePath);
             PROJECT_CACHE[userId][projIndex].files.push({ name: relativePath, content: contentBuffer });
         }
     }
 
+    // 2. Update DB (Background)
     const safeId = new ObjectId(String(projId));
-    projectsCol.updateOne({ _id: safeId }, { $pull: { files: { name: relativePath } } }).then(() => {
-        projectsCol.updateOne({ _id: safeId }, { $push: { files: { name: relativePath, content: contentBuffer } } }).catch(()=>{});
-    }).catch(()=>{});
+    projectsCol.updateOne(
+        { _id: safeId },
+        { $pull: { files: { name: relativePath } } }
+    ).then(() => {
+        projectsCol.updateOne(
+            { _id: safeId },
+            { $push: { files: { name: relativePath, content: contentBuffer } } }
+        ).catch(err => console.error("BG Save Error:", err.message));
+    }).catch(err => console.error("BG Pull Error:", err.message));
+    
     return true;
 }
 
-// ================= 🔥 FIXED: ROBUST NPM INSTALLER 🔥 =================
+// ================= PROCESS MANAGEMENT =================
 
 function installDependencies(basePath, chatId) {
     console.log(`[NPM] Starting install in: ${basePath}`);
-    
     return new Promise((resolve, reject) => {
         if (!fs.existsSync(path.join(basePath, 'package.json'))) {
             return resolve("No package.json");
         }
 
-        // Notify user that installation is happening
         if(chatId) bot.sendMessage(chatId, `📦 *Installing Modules (Wait)...*`, { parse_mode: 'Markdown' }).catch(e => {});
 
         const install = spawn('npm', ['install'], { cwd: basePath, shell: true });
 
-        // Debugging logs to see what's happening
         install.stdout.on('data', (d) => console.log(`[NPM OUT] ${d}`));
         install.stderr.on('data', (d) => console.error(`[NPM ERR] ${d}`));
 
@@ -191,8 +208,6 @@ function installDependencies(basePath, chatId) {
         });
     });
 }
-
-// ====================================================================
 
 function startFullSyncWatcher(userId, projId, basePath) {
     const watcherId = projId.toString();
@@ -229,11 +244,13 @@ async function forceStopProject(projId) {
         delete FILE_WATCHERS[pid];
     }
     
+    // Update Local Cache Status
     for (const uid in PROJECT_CACHE) {
         const p = PROJECT_CACHE[uid].find(x => x._id.toString() === pid);
         if (p) p.status = "Stopped";
     }
     
+    // Update DB
     await projectsCol.updateOne({ _id: new ObjectId(String(projId)) }, { $set: { status: "Stopped" } });
 }
 
@@ -258,6 +275,7 @@ async function renewSession(userId, projId, chatId, basePath) {
 // ================= 🔥 MAIN START PROJECT (Strict Check) 🔥 =================
 
 async function startProject(userId, projId, chatId, silent = false) {
+    // 1. Get from Cache (Instant)
     let projectData = null;
     if (PROJECT_CACHE[userId]) {
         projectData = PROJECT_CACHE[userId].find(p => p._id.toString() === projId.toString());
@@ -274,11 +292,11 @@ async function startProject(userId, projId, chatId, silent = false) {
     await forceStopProject(projId);
     const safeName = escapeMarkdown(projName);
 
-    if (!silent && chatId) bot.sendMessage(chatId, `⏳ *Checking files for ${safeName}...*`, { parse_mode: 'Markdown' }).catch(e => {});
+    if (!silent && chatId) bot.sendMessage(chatId, `⏳ *Starting ${safeName}...*`, { parse_mode: 'Markdown' }).catch(e => {});
 
     if (!fs.existsSync(basePath)) fs.mkdirSync(basePath, { recursive: true });
     
-    // Ensure files are written
+    // Ensure files exist
     if (projectData.files) {
         for (const file of projectData.files) {
             const fullPath = path.join(basePath, file.name);
@@ -289,19 +307,18 @@ async function startProject(userId, projId, chatId, silent = false) {
     }
 
     // 🔥 STRICT DEPENDENCY CHECK
-    // اگر package.json ہے اور node_modules نہیں ہے، تو انسٹال لازمی کرو اور انتظار کرو
     const pkgPath = path.join(basePath, 'package.json');
     const modulesPath = path.join(basePath, 'node_modules');
 
     if (fs.existsSync(pkgPath)) {
         if (!fs.existsSync(modulesPath)) {
             try {
-                // یہاں AWAIT لگا ہے، یعنی جب تک انسٹال نہ ہو، اگلی لائن نہیں چلے گی
+                // AWAIT INSTALLATION
                 await installDependencies(basePath, chatId);
             } catch (err) {
                 console.error("Install Failed:", err);
                 if(chatId) bot.sendMessage(chatId, "❌ Cannot start: Dependencies failed to install.");
-                return; // یہیں رک جاؤ
+                return;
             }
         }
     }
@@ -323,7 +340,9 @@ async function startProject(userId, projId, chatId, silent = false) {
 
     startFullSyncWatcher(userId, projId, basePath);
     
+    // Update Cache
     projectData.status = "Running";
+    // Update DB
     projectsCol.updateOne({ _id: new ObjectId(String(projId)) }, { $set: { status: "Running", path: basePath } });
 
     child.stdout.on('data', (data) => {
@@ -683,4 +702,29 @@ async function moveFile(userId, projData, basePath, fileName, targetFolder, chat
 
     try {
         if (!fs.existsSync(oldPath)) {
-             await bot.sendMessage(chatId, `⚠️ File not found
+             await bot.sendMessage(chatId, `⚠️ File not found: \`${fileName}\`\nUpload it first!`, { parse_mode: 'Markdown' });
+             return;
+        }
+        if (!fs.existsSync(newDir)) await fs.promises.mkdir(newDir, { recursive: true });
+        
+        await fs.promises.rename(oldPath, newPath);
+        const fileContent = await fs.promises.readFile(newPath); 
+        const relativePath = path.join(targetFolder, fileName).replace(/\\/g, '/'); 
+        
+        await saveFileToStorage(userId, projData._id, relativePath, fileContent);
+        
+        const safeId = new ObjectId(String(projData._id));
+        await projectsCol.updateOne({ _id: safeId }, { $pull: { files: { name: fileName } } });
+        
+        if (PROJECT_CACHE[userId]) {
+            const proj = PROJECT_CACHE[userId].find(p => p._id.toString() === projData._id.toString());
+            if(proj) proj.files = proj.files.filter(f => f.name !== fileName);
+        }
+
+        await bot.sendMessage(chatId, `📂 Moved: \`${fileName}\` ➡️ \`${targetFolder}\``, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await bot.sendMessage(chatId, `❌ Error moving \`${fileName}\``, { parse_mode: 'Markdown' });
+    }
+}
+
+bot.on('polling_error', (error) => console.log(`[Polling Error] ${error.code}: ${error.message}`));
