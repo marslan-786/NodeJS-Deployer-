@@ -1,0 +1,22 @@
+# 1. System Tools (Node 20, FFMPEG, Python, Build Tools)
+[phases.setup]
+nixPkgs = [
+    "nodejs-20_x",   # Node.js Version 20 (Same as FROM node:20)
+    "npm",           # Package Manager
+    "ffmpeg",        # Video/Audio conversion
+    "python3",       # Required for some node modules
+    "git",           # Version control
+    "gcc",           # C Compiler (Replacement for build-essential)
+    "gnumake",       # Make tool (Replacement for build-essential)
+    "bash",          # Shell
+    "imagemagick",   # Good for stickers (Optional but recommended)
+    "libwebp"        # Good for stickers (Optional but recommended)
+]
+
+# 2. Install Dependencies
+[phases.install]
+cmds = ["npm install"]
+
+# 3. Start The Bot
+[start]
+cmd = "node index.js"
