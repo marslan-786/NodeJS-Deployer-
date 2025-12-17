@@ -1,5 +1,5 @@
 # 1. Base Image (ہم Node.js کا وہ ورژن لیں گے جس میں سب کچھ چلتا ہے)
-FROM node:20-bullseye
+FROM node:20
 
 # 2. Install System Tools (یہ کمانڈ Git, Python اور FFMPEG زبردستی انسٹال کرے گی)
 RUN apt-get update && \
