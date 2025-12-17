@@ -1,5 +1,5 @@
 const TelegramBot = require('node-telegram-bot-api');
-const { MongoClient, ObjectId } = require('mongodb'); // ObjectId Added
+const { MongoClient, ObjectId } = require('mongodb'); 
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -19,7 +19,13 @@ const bot = new TelegramBot(TOKEN, {
     }
 });
 
-const client = new MongoClient(MONGO_URL);
+// 🔥 FIX 1: Connection Options (Timeouts handling)
+const client = new MongoClient(MONGO_URL, {
+    connectTimeoutMS: 30000,
+    socketTimeoutMS: 45000,
+    keepAlive: true
+});
+
 let db, projectsCol, keysCol, usersCol;
 
 // Global Variables
@@ -40,13 +46,33 @@ async function connectDB() {
         keysCol = db.collection("access_keys");
         usersCol = db.collection("users");
         console.log("✅ Connected to MongoDB");
+        
+        // 🔥 FIX 2: START KEEPALIVE (Database ko jagaye rakho)
+        startDBKeepAlive();
+        
         setTimeout(restoreProjects, 3000); 
     } catch (e) {
         console.error("❌ DB Error:", e);
-        process.exit(1);
+        // Retry connection logic could be added here
+        setTimeout(connectDB, 5000);
     }
 }
 connectDB();
+
+// 🔥 FIX 3: KEEP ALIVE FUNCTION
+function startDBKeepAlive() {
+    setInterval(async () => {
+        try {
+            if (db) {
+                await db.command({ ping: 1 });
+                // console.log("💓 DB Ping sent"); // Debugging ke liye
+            }
+        } catch (e) {
+            console.error("⚠️ DB Ping Failed, Reconnecting...", e.message);
+            connectDB(); // Reconnect if ping fails
+        }
+    }, 5 * 60 * 1000); // Har 5 minute baad ping karega
+}
 
 // ================= HELPER FUNCTIONS =================
 
@@ -74,7 +100,6 @@ function getMainMenu(userId) {
     return { inline_keyboard: keyboard };
 }
 
-// Extract Data safely
 function getData(data, prefix) {
     return data.substring(prefix.length); 
 }
@@ -128,8 +153,6 @@ async function moveFile(userId, projData, basePath, fileName, targetFolder, chat
         const relativePath = path.join(targetFolder, fileName).replace(/\\/g, '/'); 
         
         await saveFileToStorage(userId, projData._id, relativePath, fileContent);
-        
-        // Remove old file entry from DB
         await projectsCol.updateOne(
             { _id: projData._id }, 
             { $pull: { files: { name: fileName } } }
@@ -227,7 +250,6 @@ async function renewSession(userId, projId, chatId, basePath) {
 // ================= 🔥 MAIN START PROJECT 🔥 =================
 
 async function startProject(userId, projId, chatId, silent = false) {
-    // Fetch fresh data
     const projectData = await projectsCol.findOne({ _id: new ObjectId(projId) });
     if (!projectData) return;
 
@@ -242,7 +264,6 @@ async function startProject(userId, projId, chatId, silent = false) {
 
     if (!fs.existsSync(basePath)) fs.mkdirSync(basePath, { recursive: true });
 
-    // Restore Files
     if (projectData.files) {
         for (const file of projectData.files) {
             const fullPath = path.join(basePath, file.name);
@@ -280,7 +301,6 @@ async function startProject(userId, projId, chatId, silent = false) {
         bot.sendMessage(chatId, `🚀 *${safeName} Started\\.*\nWaiting for Output\\.\\.\\.`, { parse_mode: 'MarkdownV2' }).catch(e => {});
     }
 
-    // --- SMART LOGIC: STDOUT HANDLER ---
     child.stdout.on('data', (data) => {
         const rawOutput = data.toString();
         logStream.write(rawOutput);
@@ -290,7 +310,6 @@ async function startProject(userId, projId, chatId, silent = false) {
         const cleanOutput = rawOutput.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
         const lowerOut = cleanOutput.toLowerCase();
 
-        // 🚨 1. PAIRING CODE (Never Mute)
         const codeMatch = cleanOutput.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/) || cleanOutput.match(/Pairing Code:\s*([A-Z0-9-]{8,})/i);
         if (codeMatch) {
             let code = codeMatch[1] || codeMatch[0];
@@ -298,13 +317,11 @@ async function startProject(userId, projId, chatId, silent = false) {
             return;
         }
 
-        // 🚨 2. INPUT REQUEST (Never Mute)
         if ((lowerOut.includes("enter") || lowerOut.includes("input") || lowerOut.includes("provide") || lowerOut.includes("number?")) && cleanOutput.includes(":")) {
              bot.sendMessage(chatId, `⌨️ *Input Requested:*\n\`${escapeMarkdown(cleanOutput.trim())}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
              return;
         }
 
-        // 🚨 3. SUCCESS AUTO-MUTE (Generalized for TG & WA)
         const successKeywords = [
             "connection open", "bot connected", "authenticated", 
             "bot is live", "open: true", "success: true", "connected to whatsapp",
@@ -321,7 +338,6 @@ async function startProject(userId, projId, chatId, silent = false) {
             return;
         }
 
-        // 4. Normal Logs
         if (ACTIVE_SESSIONS[pid].logging) {
              if(cleanOutput.trim().length > 0 && cleanOutput.length < 800) {
                  bot.sendMessage(chatId, `🖥️ \`${escapeMarkdown(cleanOutput.trim())}\``, { parse_mode: "MarkdownV2" }).catch(e => {});
@@ -329,7 +345,6 @@ async function startProject(userId, projId, chatId, silent = false) {
         }
     });
 
-    // --- STDERR HANDLER ---
     child.stderr.on('data', (data) => {
         logStream.write(data);
         const error = data.toString();
@@ -378,9 +393,7 @@ bot.on('message', async (msg) => {
                     const projData = USER_STATE[userId].data;
                     const isUpdate = USER_STATE[userId].step === "update_files";
                     delete USER_STATE[userId]; 
-                    
                     const statusMsg = await bot.sendMessage(chatId, "⚙️ *Processing Actions\\.\\.\\.*", { reply_markup: { remove_keyboard: true }, parse_mode: 'MarkdownV2' });
-                    
                     if (isUpdate) await forceStopProject(projData._id);
                     setTimeout(() => {
                         startProject(userId, projData._id, chatId);
@@ -397,7 +410,6 @@ bot.on('message', async (msg) => {
                 const exists = await projectsCol.findOne({ user_id: userId, name: projName });
                 if (exists) return bot.sendMessage(chatId, "❌ Name taken.").catch(e => {});
                 
-                // CREATE DOCUMENT IMMEDIATELY TO GET ID
                 const res = await projectsCol.insertOne({
                     user_id: userId,
                     name: projName,
@@ -406,7 +418,6 @@ bot.on('message', async (msg) => {
                 });
                 
                 USER_STATE[userId] = { step: "wait_files", data: { _id: res.insertedId, name: projName } };
-                
                 const opts = { reply_markup: { resize_keyboard: true, keyboard: [[{ text: "✅ Done / Apply Actions" }]] }, parse_mode: 'MarkdownV2' };
                 bot.sendMessage(chatId, `✅ Created: *${escapeMarkdown(projName)}*\n\n1️⃣ Send files now\\.\n2️⃣ To move: \`folder/file.js\`\n3️⃣ Click Done when finished\\.`, opts).catch(e => {});
             }
@@ -431,7 +442,6 @@ bot.on('message', async (msg) => {
         } 
         
         else {
-             // Handle Input for Running Processes
              let targetPid = null;
              for (const [pid, session] of Object.entries(ACTIVE_SESSIONS)) {
                  if (session.chatId === chatId) { targetPid = pid; break; }
@@ -479,9 +489,11 @@ bot.on('callback_query', async (query) => {
     const data = query.data;
     const messageId = query.message.message_id;
 
-    try {
-        await bot.answerCallbackQuery(query.id).catch(err => {});
+    // 🔥 FIX 4: Answer Callback Immediately (Stops loading spinner)
+    // This makes the UI feel responsive even if DB is waking up
+    try { await bot.answerCallbackQuery(query.id); } catch(e) {}
 
+    try {
         if (data === "owner_panel") {
             if (!OWNER_IDS.includes(userId)) return bot.sendMessage(chatId, "⛔ Access Denied");
             const keyboard = [
@@ -546,16 +558,22 @@ bot.on('callback_query', async (query) => {
         }
         
         else if (data === "manage_projects") {
-            const projects = await projectsCol.find({ user_id: userId }).toArray();
-            
-            // 🔥 FIXED: USING ID INSTEAD OF NAME FOR BUTTONS
-            const keyboard = projects.map(p => [{ 
-                text: `${p.status === "Running" ? "🟢" : "🔴"} ${p.name}`, 
-                callback_data: `menu_${p._id.toString()}` // Safe ID used here
-            }]);
-            
-            keyboard.push([{ text: "🔙 Back", callback_data: "main_menu" }]);
-            await safeEditMessage(chatId, messageId, "📂 *Your Projects*", keyboard);
+            // 🔥 FIX 5: Ensure Connection Before Query
+            // If DB was sleeping, this will wake it up or throw clearer error
+            try {
+                const projects = await projectsCol.find({ user_id: userId }).toArray();
+                const keyboard = projects.map(p => [{ 
+                    text: `${p.status === "Running" ? "🟢" : "🔴"} ${p.name}`, 
+                    callback_data: `menu_${p._id.toString()}` 
+                }]);
+                
+                keyboard.push([{ text: "🔙 Back", callback_data: "main_menu" }]);
+                await safeEditMessage(chatId, messageId, "📂 *Your Projects*", keyboard);
+            } catch (dbErr) {
+                 console.error("DB Wakeup Error:", dbErr);
+                 bot.sendMessage(chatId, "⚠️ Database is waking up... Please try again in 5 seconds.");
+                 connectDB(); // Force reconnect attempt
+            }
         }
         
         else if (data.startsWith("menu_")) {
@@ -625,7 +643,7 @@ bot.on('callback_query', async (query) => {
         else if (data.startsWith("upd_")) {
             const projId = getData(data, "upd_");
             const proj = await projectsCol.findOne({ _id: new ObjectId(projId) });
-            USER_STATE[userId] = { step: "update_files", data: proj }; // Store Full Proj Data
+            USER_STATE[userId] = { step: "update_files", data: proj }; 
             const escapedName = escapeMarkdown(proj.name);
             const opts = { parse_mode: 'MarkdownV2', reply_markup: { resize_keyboard: true, keyboard: [[{ text: "✅ Done / Apply Actions" }]] } };
             await bot.sendMessage(chatId, `📝 *Update Mode: ${escapedName}*\n\n1️⃣ Send new files\\.\n2️⃣ To move: \`folder/file.js\`\n3️⃣ Click Done to restart\\.`, opts);
