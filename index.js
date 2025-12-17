@@ -19,11 +19,11 @@ const bot = new TelegramBot(TOKEN, {
     }
 });
 
-// 🔥 FIX 1: Connection Options (Timeouts handling)
+// 🔥 FIX: Removed 'keepAlive: true' to fix the MongoParseError
 const client = new MongoClient(MONGO_URL, {
     connectTimeoutMS: 30000,
-    socketTimeoutMS: 45000,
-    keepAlive: true
+    socketTimeoutMS: 45000
+    // keepAlive: true  <-- DELETED THIS LINE
 });
 
 let db, projectsCol, keysCol, usersCol;
@@ -47,31 +47,29 @@ async function connectDB() {
         usersCol = db.collection("users");
         console.log("✅ Connected to MongoDB");
         
-        // 🔥 FIX 2: START KEEPALIVE (Database ko jagaye rakho)
+        // Start Ping to keep connection active
         startDBKeepAlive();
         
         setTimeout(restoreProjects, 3000); 
     } catch (e) {
         console.error("❌ DB Error:", e);
-        // Retry connection logic could be added here
         setTimeout(connectDB, 5000);
     }
 }
 connectDB();
 
-// 🔥 FIX 3: KEEP ALIVE FUNCTION
+// Manual Keep-Alive Ping
 function startDBKeepAlive() {
     setInterval(async () => {
         try {
             if (db) {
                 await db.command({ ping: 1 });
-                // console.log("💓 DB Ping sent"); // Debugging ke liye
             }
         } catch (e) {
             console.error("⚠️ DB Ping Failed, Reconnecting...", e.message);
-            connectDB(); // Reconnect if ping fails
+            connectDB(); 
         }
-    }, 5 * 60 * 1000); // Har 5 minute baad ping karega
+    }, 5 * 60 * 1000); 
 }
 
 // ================= HELPER FUNCTIONS =================
@@ -459,28 +457,6 @@ bot.on('message', async (msg) => {
     } catch (err) { }
 });
 
-bot.on('document', async (msg) => {
-    try {
-        const userId = msg.from.id;
-        if (USER_STATE[userId] && (USER_STATE[userId].step === "wait_files" || USER_STATE[userId].step === "update_files")) {
-            const projData = USER_STATE[userId].data;
-            const fileName = msg.document.file_name;
-            const dir = path.join(__dirname, 'deployments', userId.toString(), projData.name);
-            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-            const filePath = path.join(dir, fileName);
-            const fileLink = await bot.getFileLink(msg.document.file_id);
-            const response = await fetch(fileLink);
-            const buffer = await response.arrayBuffer();
-            
-            fs.writeFileSync(filePath, Buffer.from(buffer));
-            await saveFileToStorage(userId, projData._id, fileName, Buffer.from(buffer));
-
-            bot.sendMessage(msg.chat.id, `📥 Received: \`${escapeMarkdown(fileName)}\``, { parse_mode: 'MarkdownV2' }).catch(e => {});
-        }
-    } catch (err) { }
-});
-
 // ================= CALLBACK HANDLING =================
 
 bot.on('callback_query', async (query) => {
@@ -489,8 +465,6 @@ bot.on('callback_query', async (query) => {
     const data = query.data;
     const messageId = query.message.message_id;
 
-    // 🔥 FIX 4: Answer Callback Immediately (Stops loading spinner)
-    // This makes the UI feel responsive even if DB is waking up
     try { await bot.answerCallbackQuery(query.id); } catch(e) {}
 
     try {
@@ -558,8 +532,6 @@ bot.on('callback_query', async (query) => {
         }
         
         else if (data === "manage_projects") {
-            // 🔥 FIX 5: Ensure Connection Before Query
-            // If DB was sleeping, this will wake it up or throw clearer error
             try {
                 const projects = await projectsCol.find({ user_id: userId }).toArray();
                 const keyboard = projects.map(p => [{ 
@@ -572,7 +544,7 @@ bot.on('callback_query', async (query) => {
             } catch (dbErr) {
                  console.error("DB Wakeup Error:", dbErr);
                  bot.sendMessage(chatId, "⚠️ Database is waking up... Please try again in 5 seconds.");
-                 connectDB(); // Force reconnect attempt
+                 connectDB(); 
             }
         }
         
