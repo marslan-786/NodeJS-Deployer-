@@ -101,7 +101,7 @@ async function moveFilesToFolder(userId, projData, inputLine, chatId) {
     try {
         const parts = inputLine.trim().split(/\s+/);
         if (parts.length < 2) {
-            await safeSendMessage(chatId, "❌ Invalid format. Use: `folder_name file1 file2 ...`", 'Markdown');
+            await safeSendMessage(chatId, "❌ Invalid format. Use: `folder_name file1 file2 ...`", { parse_mode: 'Markdown' });
             return;
         }
 
@@ -131,39 +131,44 @@ async function moveFilesToFolder(userId, projData, inputLine, chatId) {
                 fs.renameSync(oldPath, newPath);
                 movedCount++;
                 
-                await safeSendMessage(chatId, `📂 Moved: \`${fileName}\` ➡️ \`${folderName}/\``, 'Markdown');
+                await safeSendMessage(chatId, `📂 Moved: \`${fileName}\` ➡️ \`${folderName}/\``, { parse_mode: 'Markdown' });
             } else {
-                await safeSendMessage(chatId, `⚠️ File not found: \`${fileName}\``, 'Markdown');
+                await safeSendMessage(chatId, `⚠️ File not found: \`${fileName}\``, { parse_mode: 'Markdown' });
             }
         }
         
         if (movedCount > 0) {
-            await safeSendMessage(chatId, `✅ Successfully moved ${movedCount} file(s) to \`${folderName}/\``, 'Markdown');
+            await safeSendMessage(chatId, `✅ Successfully moved ${movedCount} file(s) to \`${folderName}/\``, { parse_mode: 'Markdown' });
         }
     } catch (e) {
         console.error("Error moving files:", e);
-        await safeSendMessage(chatId, `❌ Error moving files: ${e.message}`, 'Markdown');
+        await safeSendMessage(chatId, `❌ Error moving files: ${e.message}`);
     }
 }
 
 // ================= SAFE MESSAGE SENDING =================
 
-async function safeSendMessage(chatId, text, parse_mode = null) {
+async function safeSendMessage(chatId, text, options = {}) {
     try {
-        const options = {};
-        if (parse_mode) {
-            options.parse_mode = parse_mode;
+        // If parse_mode is MarkdownV2 and there might be issues, convert to Markdown
+        if (options.parse_mode === 'MarkdownV2') {
+            const escapedText = escapeMarkdownV2(text);
+            return await bot.sendMessage(chatId, escapedText, options);
         }
+        
         return await bot.sendMessage(chatId, text, options);
     } catch (e) {
         console.error("Error sending message:", e.message);
         // اگر مارک ڈاؤن ایرر ہے تو سادہ متن بھیج دیں
         if (e.message.includes("can't parse entities")) {
             try {
-                const plainText = text.replace(/[\\_*[\]()~`>#+\-=|{}.!]/g, '');
-                return await bot.sendMessage(chatId, plainText);
+                const plainOptions = { ...options };
+                delete plainOptions.parse_mode; // Remove parse_mode
+                return await bot.sendMessage(chatId, text, plainOptions);
             } catch (err) {
                 console.error("Even plain text failed:", err.message);
+                // Last resort: send without any formatting
+                return await bot.sendMessage(chatId, text.replace(/[\\_*[\]()~`>#+\-=|{}.!]/g, ''));
             }
         }
         return null;
@@ -186,7 +191,6 @@ async function safeEditMessage(chatId, messageId, text, reply_markup = null) {
         return await bot.editMessageText(text, options);
     } catch (e) {
         if (e.message.includes("message is not modified")) {
-            // یہ ایرر عام ہے، اسے ignore کریں
             return null;
         }
         if (e.message.includes("can't parse entities")) {
@@ -253,7 +257,7 @@ async function startProject(userId, projId, chatId, silent = false) {
         const projectData = await projectsCol.findOne({ _id: new ObjectId(String(projId)) });
         if (!projectData) {
             if (!silent && chatId) {
-                await safeSendMessage(chatId, "❌ Project not found!", 'Markdown');
+                await safeSendMessage(chatId, "❌ Project not found!");
             }
             return;
         }
@@ -284,7 +288,7 @@ async function startProject(userId, projId, chatId, silent = false) {
         }
 
         if (!silent && chatId) {
-            await safeSendMessage(chatId, `⏳ Starting *${escapeMarkdown(projectData.name)}*...`, 'Markdown');
+            await safeSendMessage(chatId, `⏳ Starting *${escapeMarkdown(projectData.name)}*...`, { parse_mode: 'Markdown' });
         }
 
         // Install dependencies
@@ -292,7 +296,7 @@ async function startProject(userId, projId, chatId, silent = false) {
         if (fs.existsSync(packagePath)) {
             console.log("Installing npm dependencies...");
             if (!silent && chatId) {
-                await safeSendMessage(chatId, "📦 Installing dependencies...", 'Markdown');
+                await safeSendMessage(chatId, "📦 Installing dependencies...");
             }
             
             const install = spawn('npm', ['install', '--omit=dev'], { 
@@ -348,7 +352,7 @@ async function startProject(userId, projId, chatId, silent = false) {
                     // Check for pairing code
                     const codeMatch = out.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/);
                     if (codeMatch) {
-                        await safeSendMessage(chatId, `🔑 *Pairing Code:* \`${codeMatch[0]}\``, 'Markdown');
+                        await safeSendMessage(chatId, `🔑 *Pairing Code:* \`${codeMatch[0]}\``, { parse_mode: 'Markdown' });
                     } 
                     // Send important logs (avoid spam)
                     else if (out.length < 200) {
@@ -356,7 +360,7 @@ async function startProject(userId, projId, chatId, silent = false) {
                                                  'listening', 'Listening', 'connected', 'Connected', 'failed', 'Failed'];
                         const lowerOut = out.toLowerCase();
                         if (importantKeywords.some(keyword => lowerOut.includes(keyword.toLowerCase())) || out.length < 100) {
-                            await safeSendMessage(chatId, `📝 \`${escapeMarkdown(out)}\``, 'Markdown');
+                            await safeSendMessage(chatId, `📝 \`${escapeMarkdown(out)}\``, { parse_mode: 'Markdown' });
                         }
                     }
                 }
@@ -388,7 +392,7 @@ async function startProject(userId, projId, chatId, silent = false) {
                 
                 if (!silent && session.chatId && code !== 0) {
                     await safeSendMessage(session.chatId, 
-                        `⚠️ Project *${escapeMarkdown(session.name)}* stopped with code ${code}`, 'Markdown');
+                        `⚠️ Project *${escapeMarkdown(session.name)}* stopped with code ${code}`, { parse_mode: 'Markdown' });
                 }
                 
                 delete ACTIVE_SESSIONS[projId.toString()];
@@ -405,7 +409,7 @@ async function startProject(userId, projId, chatId, silent = false) {
             logStream.write(`[${new Date().toISOString()}] [PROCESS ERROR] ${error.message}\n`);
             
             if (!silent && chatId) {
-                await safeSendMessage(chatId, `❌ Error starting project: ${error.message}`, 'Markdown');
+                await safeSendMessage(chatId, `❌ Error starting project: ${error.message}`);
             }
         });
 
@@ -413,7 +417,7 @@ async function startProject(userId, projId, chatId, silent = false) {
     } catch (e) {
         console.error(`Error in startProject for ${projId}:`, e);
         if (!silent && chatId) {
-            await safeSendMessage(chatId, `❌ Failed to start project: ${e.message}`, 'Markdown');
+            await safeSendMessage(chatId, `❌ Failed to start project: ${e.message}`);
         }
         return false;
     }
@@ -427,11 +431,15 @@ bot.on('message', async (msg) => {
         const userId = msg.from.id;
         const text = msg.text;
 
-        if (!await isAuthorized(userId)) {
-            return;
-        }
+        if (!text) return;
 
         if (text === "/start") {
+            if (!await isAuthorized(userId)) {
+                await safeSendMessage(chatId, "❌ You are not authorized to use this bot.");
+                return;
+            }
+
+            // Build keyboard based on user type
             const keyboard = {
                 inline_keyboard: [
                     [{ text: "🚀 Deploy Project", callback_data: "deploy_new" }],
@@ -443,7 +451,10 @@ bot.on('message', async (msg) => {
                 keyboard.inline_keyboard.push([{ text: "👑 Owner Panel", callback_data: "owner_panel" }]);
             }
             
-            await safeSendMessage(chatId, "👋 *Node Master Bot*", 'Markdown', keyboard);
+            await safeSendMessage(chatId, "👋 *Node Master Bot*\n\nSelect an option:", {
+                parse_mode: 'Markdown',
+                reply_markup: keyboard
+            });
             return;
         }
 
@@ -496,15 +507,10 @@ bot.on('message', async (msg) => {
                     data: { _id: res.insertedId, name: text } 
                 };
                 
-                const messageText = `✅ Project *${escapeMarkdown(text)}* Created\\.\n\n` +
-                                  `Send your project files or use move commands\\.\n\n` +
-                                  `*Example move command:*\n` +
-                                  `\`folder\\_name file1\\.js file2\\.js\`\n\n` +
-                                  `Click "✅ Done / Apply Actions" when finished\\.`;
+                await safeSendMessage(chatId, `✅ Project *${escapeMarkdown(text)}* created.`, {
+                    parse_mode: 'Markdown'
+                });
                 
-                await safeSendMessage(chatId, messageText, 'MarkdownV2');
-                
-                // اضافی پیغام جو واضح ہو
                 await bot.sendMessage(chatId, `📁 Now send your project files (JavaScript, JSON, etc.) one by one.`, {
                     reply_markup: { 
                         resize_keyboard: true, 
@@ -542,13 +548,13 @@ bot.on('document', async (msg) => {
                 const success = await saveFileToStorage(userId, state.data._id, fileName, Buffer.from(buffer));
                 
                 if (success) {
-                    await safeSendMessage(chatId, `✅ File saved: \`${fileName}\``, 'Markdown');
+                    await safeSendMessage(chatId, `✅ File saved: \`${fileName}\``, { parse_mode: 'Markdown' });
                 } else {
-                    await safeSendMessage(chatId, `❌ Failed to save: \`${fileName}\``, 'Markdown');
+                    await safeSendMessage(chatId, `❌ Failed to save: \`${fileName}\``, { parse_mode: 'Markdown' });
                 }
             } catch (e) {
                 console.error("Error downloading file:", e);
-                await safeSendMessage(chatId, `❌ Error downloading file: ${e.message}`, 'Markdown');
+                await safeSendMessage(chatId, `❌ Error downloading file: ${e.message}`);
             }
         }
     } catch (e) {
@@ -620,7 +626,7 @@ bot.on('callback_query', async (query) => {
             const proj = await projectsCol.findOne({ _id: new ObjectId(projId) });
             
             if (!proj) {
-                await safeSendMessage(chatId, "❌ Project not found", 'Markdown');
+                await safeSendMessage(chatId, "❌ Project not found");
                 return;
             }
             
@@ -664,12 +670,12 @@ bot.on('callback_query', async (query) => {
             
             if (ACTIVE_SESSIONS[projId]) {
                 await forceStopProject(projId);
-                await safeSendMessage(chatId, `🛑 Stopped project`, 'Markdown');
+                await safeSendMessage(chatId, `🛑 Stopped project`);
             } else {
                 await startProject(userId, projId, chatId);
             }
             
-            // مینیو ری فریش کریں
+            // Refresh menu
             setTimeout(() => {
                 bot.answerCallbackQuery({
                     id: query.id,
@@ -706,7 +712,7 @@ bot.on('callback_query', async (query) => {
             const proj = await projectsCol.findOne({ _id: new ObjectId(projId) });
             
             if (!proj) {
-                await safeSendMessage(chatId, "❌ Project not found", 'Markdown');
+                await safeSendMessage(chatId, "❌ Project not found");
                 return;
             }
             
@@ -717,21 +723,19 @@ bot.on('callback_query', async (query) => {
                 data: proj 
             };
             
-            // اہم: سادہ متن استعمال کریں مارک ڈاؤن کے بغیر
-            const messageText = `📝 UPDATE MODE: ${proj.name}\n\n` +
+            const messageText = `📝 *UPDATE MODE:* ${proj.name}\n\n` +
                               `Send files to replace existing ones.\n` +
-                              `Use move command to organize: folder_name file1.js file2.js\n\n` +
+                              `Use move command to organize: \`folder_name file1.js file2.js\`\n\n` +
                               `Click "✅ Done / Apply Actions" when finished.`;
             
-            await bot.sendMessage(chatId, messageText, {
+            await safeSendMessage(chatId, messageText, { parse_mode: 'Markdown' });
+            
+            await bot.sendMessage(chatId, `📁 Now you can send files. Each new file will replace the existing one with same name.`, {
                 reply_markup: { 
                     resize_keyboard: true, 
                     keyboard: [[{ text: "✅ Done / Apply Actions" }]] 
                 }
             });
-            
-            // اضافی پیغام جو واضح ہو
-            await safeSendMessage(chatId, `📁 Now you can send files. Each new file will replace the existing one with same name.`);
         }
 
         if (data.startsWith("renew_")) {
@@ -757,7 +761,7 @@ bot.on('callback_query', async (query) => {
                 });
             }
             
-            await safeSendMessage(chatId, "🔄 Session cleaned. Restarting...", 'Markdown');
+            await safeSendMessage(chatId, "🔄 Session cleaned. Restarting...");
             await startProject(userId, projId, chatId);
         }
 
@@ -772,10 +776,10 @@ bot.on('callback_query', async (query) => {
                         caption: `📊 Logs for project ${projId}`
                     });
                 } else {
-                    await safeSendMessage(chatId, "Log file is empty", 'Markdown');
+                    await safeSendMessage(chatId, "Log file is empty");
                 }
             } else {
-                await safeSendMessage(chatId, "No logs available yet", 'Markdown');
+                await safeSendMessage(chatId, "No logs available yet");
             }
         }
 
