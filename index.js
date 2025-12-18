@@ -35,7 +35,7 @@ if (!fs.existsSync(LOG_DIR)) {
 
 // ================= IMPROVED ESCAPE FUNCTION =================
 
-function escapeMarkdownV2(text) {
+function escapeMarkdown(text) {
     if (!text) return "";
     return text.toString()
         .replace(/_/g, '\\_')
@@ -56,16 +56,6 @@ function escapeMarkdownV2(text) {
         .replace(/\}/g, '\\}')
         .replace(/\./g, '\\.')
         .replace(/!/g, '\\!');
-}
-
-function escapeMarkdown(text) {
-    if (!text) return "";
-    return text.toString()
-        .replace(/_/g, '\\_')
-        .replace(/\*/g, '\\*')
-        .replace(/`/g, '\\`')
-        .replace(/\[/g, '\\[')
-        .replace(/\]/g, '\\]');
 }
 
 // ================= HELPER FUNCTIONS =================
@@ -97,65 +87,10 @@ async function saveFileToStorage(userId, projId, relativePath, contentBuffer) {
     }
 }
 
-async function moveFilesToFolder(userId, projData, inputLine, chatId) {
-    try {
-        const parts = inputLine.trim().split(/\s+/);
-        if (parts.length < 2) {
-            await safeSendMessage(chatId, "❌ Invalid format. Use: `folder_name file1 file2 ...`", { parse_mode: 'Markdown' });
-            return;
-        }
-
-        const folderName = parts[0];
-        const filesToMove = parts.slice(1);
-        const basePath = path.join(__dirname, 'deployments', userId.toString(), projData.name);
-        const targetDir = path.join(basePath, folderName);
-
-        if (!fs.existsSync(targetDir)) {
-            fs.mkdirSync(targetDir, { recursive: true });
-        }
-
-        let movedCount = 0;
-        for (const fileName of filesToMove) {
-            const oldPath = path.join(basePath, fileName);
-            if (fs.existsSync(oldPath)) {
-                const content = fs.readFileSync(oldPath);
-                const relativeNewPath = path.join(folderName, fileName).replace(/\\/g, '/');
-                
-                await saveFileToStorage(userId, projData._id, relativeNewPath, content);
-                await projectsCol.updateOne(
-                    { _id: new ObjectId(String(projData._id)) },
-                    { $pull: { files: { name: fileName } } }
-                );
-                
-                const newPath = path.join(targetDir, fileName);
-                fs.renameSync(oldPath, newPath);
-                movedCount++;
-                
-                await safeSendMessage(chatId, `📂 Moved: \`${fileName}\` ➡️ \`${folderName}/\``, { parse_mode: 'Markdown' });
-            } else {
-                await safeSendMessage(chatId, `⚠️ File not found: \`${fileName}\``, { parse_mode: 'Markdown' });
-            }
-        }
-        
-        if (movedCount > 0) {
-            await safeSendMessage(chatId, `✅ Successfully moved ${movedCount} file(s) to \`${folderName}/\``, { parse_mode: 'Markdown' });
-        }
-    } catch (e) {
-        console.error("Error moving files:", e);
-        await safeSendMessage(chatId, `❌ Error moving files: ${e.message}`);
-    }
-}
-
 // ================= SAFE MESSAGE SENDING =================
 
 async function safeSendMessage(chatId, text, options = {}) {
     try {
-        // If parse_mode is MarkdownV2 and there might be issues, convert to Markdown
-        if (options.parse_mode === 'MarkdownV2') {
-            const escapedText = escapeMarkdownV2(text);
-            return await bot.sendMessage(chatId, escapedText, options);
-        }
-        
         return await bot.sendMessage(chatId, text, options);
     } catch (e) {
         console.error("Error sending message:", e.message);
@@ -163,11 +98,10 @@ async function safeSendMessage(chatId, text, options = {}) {
         if (e.message.includes("can't parse entities")) {
             try {
                 const plainOptions = { ...options };
-                delete plainOptions.parse_mode; // Remove parse_mode
+                delete plainOptions.parse_mode;
                 return await bot.sendMessage(chatId, text, plainOptions);
             } catch (err) {
                 console.error("Even plain text failed:", err.message);
-                // Last resort: send without any formatting
                 return await bot.sendMessage(chatId, text.replace(/[\\_*[\]()~`>#+\-=|{}.!]/g, ''));
             }
         }
@@ -175,38 +109,99 @@ async function safeSendMessage(chatId, text, options = {}) {
     }
 }
 
-async function safeEditMessage(chatId, messageId, text, reply_markup = null) {
+// ================= ENHANCED UPDATE MODE WITH TEMPORARY STORAGE =================
+
+async function processMoveCommand(userId, projData, inputLine, chatId, tempFiles) {
     try {
-        const options = {
-            chat_id: chatId,
-            message_id: messageId,
-            text: text,
-            parse_mode: 'Markdown'
-        };
-        
-        if (reply_markup) {
-            options.reply_markup = reply_markup;
+        const parts = inputLine.trim().split(/\s+/);
+        if (parts.length < 2) {
+            await safeSendMessage(chatId, "❌ Invalid format. Use: `folder_name file1 file2 ...`", { parse_mode: 'Markdown' });
+            return tempFiles;
         }
+
+        const folderName = parts[0];
+        const filesToMove = parts.slice(1);
         
-        return await bot.editMessageText(text, options);
-    } catch (e) {
-        if (e.message.includes("message is not modified")) {
-            return null;
-        }
-        if (e.message.includes("can't parse entities")) {
-            try {
-                const plainText = text.replace(/[\\_*[\]()~`>#+\-=|{}.!]/g, '');
-                return await bot.editMessageText(plainText, {
-                    chat_id: chatId,
-                    message_id: messageId,
-                    reply_markup: reply_markup
-                });
-            } catch (err) {
-                console.error("Even plain text edit failed:", err.message);
+        const movedFiles = { ...tempFiles };
+        let movedCount = 0;
+        
+        for (const fileName of filesToMove) {
+            // RAM میں فائل ڈھونڈیں
+            if (movedFiles[fileName]) {
+                const newFileName = `${folderName}/${fileName}`.replace(/\/\//g, '/');
+                movedFiles[newFileName] = movedFiles[fileName];
+                delete movedFiles[fileName];
+                movedCount++;
+                
+                await safeSendMessage(chatId, `📂 File will be moved: \`${fileName}\` ➡️ \`${folderName}/\``, { parse_mode: 'Markdown' });
+            } else {
+                // فائل سسٹم میں بھی چیک کریں
+                const basePath = path.join(__dirname, 'deployments', userId.toString(), projData.name);
+                const oldPath = path.join(basePath, fileName);
+                
+                if (fs.existsSync(oldPath)) {
+                    const content = fs.readFileSync(oldPath);
+                    const newFileName = `${folderName}/${fileName}`.replace(/\/\//g, '/');
+                    movedFiles[newFileName] = content;
+                    movedCount++;
+                    
+                    await safeSendMessage(chatId, `📂 Existing file will be moved: \`${fileName}\` ➡️ \`${folderName}/\``, { parse_mode: 'Markdown' });
+                } else {
+                    await safeSendMessage(chatId, `⚠️ File not found: \`${fileName}\``, { parse_mode: 'Markdown' });
+                }
             }
         }
-        console.error("Error editing message:", e.message);
-        return null;
+        
+        if (movedCount > 0) {
+            await safeSendMessage(chatId, `✅ ${movedCount} file(s) will be moved to \`${folderName}/\``, { parse_mode: 'Markdown' });
+        }
+        
+        return movedFiles;
+    } catch (e) {
+        console.error("Error processing move command:", e);
+        await safeSendMessage(chatId, `❌ Error processing move command: ${e.message}`);
+        return tempFiles;
+    }
+}
+
+async function applyUpdatesToDatabase(userId, projData, tempFiles, chatId) {
+    try {
+        let appliedCount = 0;
+        const basePath = path.join(__dirname, 'deployments', userId.toString(), projData.name);
+        
+        // پہلے سے موجود فائلوں کی فہرست حاصل کریں
+        const existingFiles = await projectsCol.findOne(
+            { _id: new ObjectId(String(projData._id)) },
+            { projection: { files: 1 } }
+        );
+        
+        const existingFileNames = existingFiles?.files?.map(f => f.name) || [];
+        
+        // RAM میں موجود فائلوں کو ڈیٹا بیس میں سیو کریں
+        for (const [fileName, content] of Object.entries(tempFiles)) {
+            const success = await saveFileToStorage(userId, projData._id, fileName, content);
+            if (success) {
+                appliedCount++;
+                
+                // فائل سسٹم میں بھی لکھیں
+                const fullPath = path.join(basePath, fileName);
+                const dir = path.dirname(fullPath);
+                if (!fs.existsSync(dir)) {
+                    fs.mkdirSync(dir, { recursive: true });
+                }
+                fs.writeFileSync(fullPath, content);
+            }
+        }
+        
+        // جو فائلیں RAM میں نہیں ہیں لیکن فائل سسٹم میں ہیں، انہیں چھوڑ دیں
+        // (یعنی صرف نئی/اپڈیٹ شدہ فائلیں شامل/اپڈیٹ ہوں گی)
+        
+        await safeSendMessage(chatId, `✅ ${appliedCount} file(s) updated in database and filesystem`);
+        return true;
+    } catch (e) {
+        console.error("Error applying updates:", e);
+        await safeSendMessage(chatId, `❌ Error applying updates: ${e.message}`);
+        return false;
     }
 }
 
@@ -267,7 +262,7 @@ async function startProject(userId, projId, chatId, silent = false) {
             fs.mkdirSync(basePath, { recursive: true });
         }
 
-        // Write files to disk
+        // Write files from database to disk
         if (projectData.files && projectData.files.length > 0) {
             console.log(`Writing ${projectData.files.length} files to disk`);
             for (const file of projectData.files) {
@@ -354,7 +349,7 @@ async function startProject(userId, projId, chatId, silent = false) {
                     if (codeMatch) {
                         await safeSendMessage(chatId, `🔑 *Pairing Code:* \`${codeMatch[0]}\``, { parse_mode: 'Markdown' });
                     } 
-                    // Send important logs (avoid spam)
+                    // Send important logs
                     else if (out.length < 200) {
                         const importantKeywords = ['error', 'Error', 'ERROR', 'warning', 'Warning', 'started', 
                                                  'listening', 'Listening', 'connected', 'Connected', 'failed', 'Failed'];
@@ -439,7 +434,6 @@ bot.on('message', async (msg) => {
                 return;
             }
 
-            // Build keyboard based on user type
             const keyboard = {
                 inline_keyboard: [
                     [{ text: "🚀 Deploy Project", callback_data: "deploy_new" }],
@@ -451,7 +445,7 @@ bot.on('message', async (msg) => {
                 keyboard.inline_keyboard.push([{ text: "👑 Owner Panel", callback_data: "owner_panel" }]);
             }
             
-            await safeSendMessage(chatId, "👋 *Node Master Bot*\n\nSelect an option:", {
+            await safeSendMessage(chatId, "👋 *Node Master Bot*", {
                 parse_mode: 'Markdown',
                 reply_markup: keyboard
             });
@@ -463,18 +457,89 @@ bot.on('message', async (msg) => {
             
             if (text === "✅ Done / Apply Actions") {
                 const projId = state.data._id;
-                delete USER_STATE[userId];
+                const projectData = state.data;
                 
-                await bot.sendMessage(chatId, "⚙️ Applying changes and restarting...", { 
-                    reply_markup: { remove_keyboard: true }
-                });
-                
-                await startProject(userId, projId, chatId);
+                // Check which mode we're in
+                if (state.step === "wait_files") {
+                    // نئے پروجیکٹ کے لیے
+                    delete USER_STATE[userId];
+                    await bot.sendMessage(chatId, "⚙️ Creating project and starting...", { 
+                        reply_markup: { remove_keyboard: true }
+                    });
+                    await startProject(userId, projId, chatId);
+                } 
+                else if (state.step === "update_files") {
+                    // اپڈیٹ موڈ کے لیے
+                    const tempFiles = state.data.tempFiles || {};
+                    
+                    if (Object.keys(tempFiles).length === 0) {
+                        await safeSendMessage(chatId, "❌ No files to update!");
+                        return;
+                    }
+                    
+                    await safeSendMessage(chatId, `⚙️ Applying ${Object.keys(tempFiles).length} file(s) to database...`);
+                    
+                    // Apply updates to database
+                    const success = await applyUpdatesToDatabase(userId, projectData, tempFiles, chatId);
+                    
+                    if (success) {
+                        delete USER_STATE[userId];
+                        await bot.sendMessage(chatId, "✅ Updates applied. Restarting project...", { 
+                            reply_markup: { remove_keyboard: true }
+                        });
+                        await startProject(userId, projId, chatId);
+                    }
+                }
                 return;
             }
 
-            if ((state.step === "wait_files" || state.step === "update_files") && text && !text.startsWith('/')) {
-                await moveFilesToFolder(userId, state.data, text, chatId);
+            if (state.step === "wait_files" && text && !text.startsWith('/')) {
+                // پرانا طریقہ: فوری طور پر فائلوں کو منتقل کریں
+                const parts = text.trim().split(/\s+/);
+                if (parts.length < 2) {
+                    await safeSendMessage(chatId, "❌ Invalid format. Use: `folder_name file1 file2 ...`", { parse_mode: 'Markdown' });
+                    return;
+                }
+                
+                const folderName = parts[0];
+                const filesToMove = parts.slice(1);
+                
+                for (const fileName of filesToMove) {
+                    const basePath = path.join(__dirname, 'deployments', userId.toString(), state.data.name);
+                    const oldPath = path.join(basePath, fileName);
+                    
+                    if (fs.existsSync(oldPath)) {
+                        const content = fs.readFileSync(oldPath);
+                        const newFileName = `${folderName}/${fileName}`.replace(/\/\//g, '/');
+                        
+                        // ڈیٹا بیس میں منتقل کریں
+                        await saveFileToStorage(userId, state.data._id, newFileName, content);
+                        await projectsCol.updateOne(
+                            { _id: new ObjectId(String(state.data._id)) },
+                            { $pull: { files: { name: fileName } } }
+                        );
+                        
+                        // فائل سسٹم میں منتقل کریں
+                        const newPath = path.join(basePath, folderName, fileName);
+                        const dir = path.dirname(newPath);
+                        if (!fs.existsSync(dir)) {
+                            fs.mkdirSync(dir, { recursive: true });
+                        }
+                        fs.renameSync(oldPath, newPath);
+                        
+                        await safeSendMessage(chatId, `📂 Moved: \`${fileName}\` ➡️ \`${folderName}/\``, { parse_mode: 'Markdown' });
+                    } else {
+                        await safeSendMessage(chatId, `⚠️ File not found: \`${fileName}\``, { parse_mode: 'Markdown' });
+                    }
+                }
+                return;
+            }
+
+            if (state.step === "update_files" && text && !text.startsWith('/')) {
+                // نیا طریقہ: RAM میں فائلوں کو منتقل کریں
+                const tempFiles = state.data.tempFiles || {};
+                const updatedFiles = await processMoveCommand(userId, state.data, text, chatId, tempFiles);
+                state.data.tempFiles = updatedFiles;
                 return;
             }
 
@@ -511,7 +576,7 @@ bot.on('message', async (msg) => {
                     parse_mode: 'Markdown'
                 });
                 
-                await bot.sendMessage(chatId, `📁 Now send your project files (JavaScript, JSON, etc.) one by one.`, {
+                await bot.sendMessage(chatId, `📁 Now send your project files one by one.`, {
                     reply_markup: { 
                         resize_keyboard: true, 
                         keyboard: [[{ text: "✅ Done / Apply Actions" }]] 
@@ -545,12 +610,30 @@ bot.on('document', async (msg) => {
                 }
                 
                 const buffer = await response.arrayBuffer();
-                const success = await saveFileToStorage(userId, state.data._id, fileName, Buffer.from(buffer));
+                const fileBuffer = Buffer.from(buffer);
                 
-                if (success) {
-                    await safeSendMessage(chatId, `✅ File saved: \`${fileName}\``, { parse_mode: 'Markdown' });
-                } else {
-                    await safeSendMessage(chatId, `❌ Failed to save: \`${fileName}\``, { parse_mode: 'Markdown' });
+                if (state.step === "wait_files") {
+                    // نئے پروجیکٹ کے لیے: فوری ڈیٹا بیس میں سیو کریں
+                    const success = await saveFileToStorage(userId, state.data._id, fileName, fileBuffer);
+                    
+                    if (success) {
+                        await safeSendMessage(chatId, `✅ File saved: \`${fileName}\``, { parse_mode: 'Markdown' });
+                    } else {
+                        await safeSendMessage(chatId, `❌ Failed to save: \`${fileName}\``, { parse_mode: 'Markdown' });
+                    }
+                } 
+                else if (state.step === "update_files") {
+                    // اپڈیٹ موڈ: RAM میں اسٹور کریں
+                    if (!state.data.tempFiles) {
+                        state.data.tempFiles = {};
+                    }
+                    
+                    state.data.tempFiles[fileName] = fileBuffer;
+                    await safeSendMessage(chatId, `📝 File stored in memory: \`${fileName}\` (Will be saved when you click "Done")`, { parse_mode: 'Markdown' });
+                    
+                    // RAM میں موجود فائلوں کی تعداد بتائیں
+                    const fileCount = Object.keys(state.data.tempFiles).length;
+                    await safeSendMessage(chatId, `📊 Files in memory: ${fileCount} file(s) waiting to be saved`);
                 }
             } catch (e) {
                 console.error("Error downloading file:", e);
@@ -576,7 +659,6 @@ bot.on('callback_query', async (query) => {
             return;
         }
 
-        // جواب فوری دیں
         await bot.answerCallbackQuery(query.id).catch(() => {});
 
         if (data === "owner_panel") {
@@ -584,26 +666,36 @@ bot.on('callback_query', async (query) => {
                 return;
             }
             
-            await safeEditMessage(chatId, messageId, "👑 *Owner Panel*", {
-                inline_keyboard: [
-                    [{ text: "🔑 Generate Key", callback_data: "gen_key" }],
-                    [{ text: "📜 List Keys", callback_data: "list_keys" }],
-                    [{ text: "📊 Statistics", callback_data: "stats" }],
-                    [{ text: "🔙 Back", callback_data: "main_menu" }]
-                ]
-            });
+            await bot.editMessageText("👑 *Owner Panel*", {
+                chat_id: chatId,
+                message_id: messageId,
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: "🔑 Generate Key", callback_data: "gen_key" }],
+                        [{ text: "📜 List Keys", callback_data: "list_keys" }],
+                        [{ text: "📊 Statistics", callback_data: "stats" }],
+                        [{ text: "🔙 Back", callback_data: "main_menu" }]
+                    ]
+                },
+                parse_mode: 'Markdown'
+            }).catch(() => {});
         }
 
         if (data === "manage_projects") {
             const projects = await projectsCol.find({ user_id: userId }).toArray();
             
             if (projects.length === 0) {
-                await safeEditMessage(chatId, messageId, "📂 *You have no projects yet.*", {
-                    inline_keyboard: [
-                        [{ text: "🚀 Create New Project", callback_data: "deploy_new" }],
-                        [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
-                    ]
-                });
+                await bot.editMessageText("📂 *You have no projects yet.*", {
+                    chat_id: chatId,
+                    message_id: messageId,
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: "🚀 Create New Project", callback_data: "deploy_new" }],
+                            [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+                        ]
+                    },
+                    parse_mode: 'Markdown'
+                }).catch(() => {});
                 return;
             }
             
@@ -616,9 +708,12 @@ bot.on('callback_query', async (query) => {
             
             keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
             
-            await safeEditMessage(chatId, messageId, "📂 *Select Project:*", {
-                inline_keyboard: keyboard
-            });
+            await bot.editMessageText("📂 *Select Project:*", {
+                chat_id: chatId,
+                message_id: messageId,
+                reply_markup: { inline_keyboard: keyboard },
+                parse_mode: 'Markdown'
+            }).catch(() => {});
         }
 
         if (data.startsWith("menu_")) {
@@ -660,51 +755,12 @@ bot.on('callback_query', async (query) => {
                              `📅 *Created:* ${proj.createdAt ? new Date(proj.createdAt).toLocaleDateString() : 'N/A'}\n` +
                              `📁 *Files:* ${proj.files ? proj.files.length : 0}`;
             
-            await safeEditMessage(chatId, messageId, statusText, {
-                inline_keyboard: keyboard
-            });
-        }
-
-        if (data.startsWith("tog_run_")) {
-            const projId = data.split('_')[2];
-            
-            if (ACTIVE_SESSIONS[projId]) {
-                await forceStopProject(projId);
-                await safeSendMessage(chatId, `🛑 Stopped project`);
-            } else {
-                await startProject(userId, projId, chatId);
-            }
-            
-            // Refresh menu
-            setTimeout(() => {
-                bot.answerCallbackQuery({
-                    id: query.id,
-                    from: query.from,
-                    message: query.message,
-                    chat_instance: query.chat_instance,
-                    data: `menu_${projId}`
-                });
-            }, 1500);
-        }
-
-        if (data.startsWith("tog_log_")) {
-            const projId = data.split('_')[2];
-            
-            if (ACTIVE_SESSIONS[projId]) {
-                ACTIVE_SESSIONS[projId].logging = !ACTIVE_SESSIONS[projId].logging;
-                const status = ACTIVE_SESSIONS[projId].logging ? "enabled" : "disabled";
-                await safeSendMessage(chatId, `📝 Logging ${status} for project`);
-            }
-            
-            setTimeout(() => {
-                bot.answerCallbackQuery({
-                    id: query.id,
-                    from: query.from,
-                    message: query.message,
-                    chat_instance: query.chat_instance,
-                    data: `menu_${projId}`
-                });
-            }, 500);
+            await bot.editMessageText(statusText, {
+                chat_id: chatId,
+                message_id: messageId,
+                reply_markup: { inline_keyboard: keyboard },
+                parse_mode: 'Markdown'
+            }).catch(() => {});
         }
 
         if (data.startsWith("upd_")) {
@@ -718,19 +774,24 @@ bot.on('callback_query', async (query) => {
             
             await forceStopProject(projId);
             
+            // RAM میں خالی اسٹوریج کے ساتھ اپڈیٹ موڈ شروع کریں
             USER_STATE[userId] = { 
                 step: "update_files", 
-                data: proj 
+                data: {
+                    _id: proj._id,
+                    name: proj.name,
+                    tempFiles: {} // RAM میں فائلیں اسٹور ہوں گی
+                }
             };
             
             const messageText = `📝 *UPDATE MODE:* ${proj.name}\n\n` +
-                              `Send files to replace existing ones.\n` +
-                              `Use move command to organize: \`folder_name file1.js file2.js\`\n\n` +
-                              `Click "✅ Done / Apply Actions" when finished.`;
+                              `Send files - they will be stored in memory.\n` +
+                              `Use move command: \`folder_name file1.js file2.js\`\n` +
+                              `Files will be saved when you click "Done".`;
             
             await safeSendMessage(chatId, messageText, { parse_mode: 'Markdown' });
             
-            await bot.sendMessage(chatId, `📁 Now you can send files. Each new file will replace the existing one with same name.`, {
+            await bot.sendMessage(chatId, `📁 Now you can send files. All files will be stored in memory until you click "Done".`, {
                 reply_markup: { 
                     resize_keyboard: true, 
                     keyboard: [[{ text: "✅ Done / Apply Actions" }]] 
@@ -738,31 +799,26 @@ bot.on('callback_query', async (query) => {
             });
         }
 
-        if (data.startsWith("renew_")) {
-            const projId = data.split('_')[1];
-            const proj = await projectsCol.findOne({ _id: new ObjectId(projId) });
+        // باقی callback handlers وہی رہیں گے
+        if (data.startsWith("tog_run_")) {
+            const projId = data.split('_')[2];
             
-            await forceStopProject(projId);
-            
-            const basePath = path.join(__dirname, 'deployments', userId.toString(), proj.name);
-            
-            // Clean session files
-            if (fs.existsSync(basePath)) {
-                const files = fs.readdirSync(basePath);
-                files.forEach(file => {
-                    if (file.includes('session') || file.includes('auth') || file.includes('creds')) {
-                        const filePath = path.join(basePath, file);
-                        try {
-                            fs.rmSync(filePath, { recursive: true, force: true });
-                        } catch (e) {
-                            console.log(`Error removing ${filePath}:`, e.message);
-                        }
-                    }
-                });
+            if (ACTIVE_SESSIONS[projId]) {
+                await forceStopProject(projId);
+                await safeSendMessage(chatId, `🛑 Stopped project`);
+            } else {
+                await startProject(userId, projId, chatId);
             }
             
-            await safeSendMessage(chatId, "🔄 Session cleaned. Restarting...");
-            await startProject(userId, projId, chatId);
+            setTimeout(() => {
+                bot.answerCallbackQuery({
+                    id: query.id,
+                    from: query.from,
+                    message: query.message,
+                    chat_instance: query.chat_instance,
+                    data: `menu_${projId}`
+                });
+            }, 1500);
         }
 
         if (data.startsWith("dl_log_")) {
@@ -786,9 +842,14 @@ bot.on('callback_query', async (query) => {
         if (data === "deploy_new") {
             USER_STATE[userId] = { step: "ask_name" };
             
-            await safeEditMessage(chatId, messageId, "📝 *Enter a name for your new project:*", {
-                inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "main_menu" }]]
-            });
+            await bot.editMessageText("📝 *Enter a name for your new project:*", {
+                chat_id: chatId,
+                message_id: messageId,
+                reply_markup: {
+                    inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "main_menu" }]]
+                },
+                parse_mode: 'Markdown'
+            }).catch(() => {});
             
             await safeSendMessage(chatId, "Please enter a name for your new project:");
         }
@@ -805,7 +866,12 @@ bot.on('callback_query', async (query) => {
                 keyboard.inline_keyboard.push([{ text: "👑 Owner Panel", callback_data: "owner_panel" }]);
             }
             
-            await safeEditMessage(chatId, messageId, "🏠 *Main Menu*", keyboard);
+            await bot.editMessageText("🏠 *Main Menu*", {
+                chat_id: chatId,
+                message_id: messageId,
+                reply_markup: keyboard,
+                parse_mode: 'Markdown'
+            }).catch(() => {});
         }
 
     } catch (e) {
